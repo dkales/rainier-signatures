@@ -93,6 +93,7 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
                    const RepByteContainer &output_broadcasts,
                    const std::vector<std::vector<uint8_t>> &key_deltas,
                    const std::vector<std::vector<GF>> &t_deltas,
+                   const std::vector<GF> &z_deltas,
                    const std::vector<std::vector<GF>> &P_deltas) {
 
   hash_context ctx;
@@ -114,7 +115,8 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
     for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
       hash_update_GF2E(&ctx, instance, t_deltas[repetition][ell]);
     }
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes + 1; k++) {
+    hash_update_GF2E(&ctx, instance, z_deltas[repetition]);
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
       hash_update_GF2E(&ctx, instance, P_deltas[repetition][k]);
     }
   }
@@ -125,18 +127,20 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
   return commitment;
 }
 
+// returns pairs of R,\epsion values
 template <typename GF>
-std::vector<GF> phase_1_expand(const signature_instance_t &instance,
-                               const std::vector<uint8_t> &h_1,
-                               const std::vector<GF> &forbidden_values) {
+std::vector<std::pair<GF, GF>>
+phase_1_expand(const signature_instance_t &instance,
+               const std::vector<uint8_t> &h_1,
+               const std::vector<GF> &forbidden_values) {
   hash_context ctx;
   hash_init(&ctx, instance.digest_size);
   hash_update(&ctx, h_1.data(), h_1.size());
   hash_final(&ctx);
 
   std::array<uint8_t, GF::BYTE_SIZE> buffer;
-  std::vector<GF> R_es;
-  R_es.reserve(instance.num_repetitions);
+  std::vector<std::pair<GF, GF>> R_eps;
+  R_eps.reserve(instance.num_repetitions);
   for (size_t e = 0; e < instance.num_repetitions; e++) {
     while (true) {
       hash_squeeze(&ctx, buffer.data(), buffer.size());
@@ -151,22 +155,25 @@ std::vector<GF> phase_1_expand(const signature_instance_t &instance,
         }
       }
       if (good) {
-        R_es.push_back(candidate_R);
+        hash_squeeze(&ctx, buffer.data(), buffer.size());
+        GF eps;
+        // eps does not have restrictions
+        eps.from_bytes(buffer.data());
+        R_eps.push_back(std::make_pair(candidate_R, eps));
         break;
       }
     }
   }
-  return R_es;
+  return R_eps;
 }
 
 template <typename GF>
 std::vector<uint8_t>
 phase_2_commitment(const signature_instance_t &instance, const salt_t &salt,
-                   const std::vector<uint8_t> &h_1, const std::vector<GF> &a,
-                   const std::vector<GF> &b, const std::vector<GF> &c,
-                   const std::vector<std::vector<GF>> &a_shares,
-                   const std::vector<std::vector<GF>> &b_shares,
-                   const std::vector<std::vector<GF>> &c_shares) {
+                   const std::vector<uint8_t> &h_1,
+                   const std::vector<std::vector<GF>> &alpha_shares,
+                   const std::vector<std::vector<GF>> &beta_shares,
+                   const std::vector<std::vector<GF>> &v_shares) {
 
   hash_context ctx;
   hash_init_prefix(&ctx, instance.digest_size, HASH_PREFIX_2);
@@ -175,13 +182,10 @@ phase_2_commitment(const signature_instance_t &instance, const salt_t &salt,
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
-    hash_update_GF2E(&ctx, instance, a[repetition]);
-    hash_update_GF2E(&ctx, instance, b[repetition]);
-    hash_update_GF2E(&ctx, instance, c[repetition]);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      hash_update_GF2E(&ctx, instance, a_shares[repetition][party]);
-      hash_update_GF2E(&ctx, instance, b_shares[repetition][party]);
-      hash_update_GF2E(&ctx, instance, c_shares[repetition][party]);
+      hash_update_GF2E(&ctx, instance, alpha_shares[repetition][party]);
+      hash_update_GF2E(&ctx, instance, beta_shares[repetition][party]);
+      hash_update_GF2E(&ctx, instance, v_shares[repetition][party]);
     }
   }
   hash_final(&ctx);
@@ -339,13 +343,14 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   // create seed trees and random tapes
   std::vector<SeedTree> seed_trees;
   seed_trees.reserve(instance.num_repetitions);
-  // key share + L*T_share + s_bar + t_bar + (L+1) * P_share
+  // key share + L*T_share + x_share + y_share + z_share + (L-1) *
+  // P_share
   const size_t random_tape_size =
       instance.block_cipher_params.key_size +
       instance.block_cipher_params.num_sboxes *
           instance.block_cipher_params.block_size +
-      2 * instance.block_cipher_params.block_size +
-      (instance.block_cipher_params.num_sboxes + 1) *
+      3 * instance.block_cipher_params.block_size +
+      (instance.block_cipher_params.num_sboxes - 1) *
           instance.block_cipher_params.block_size;
 
   RandomTapes random_tapes(instance.num_repetitions, instance.num_MPC_parties,
@@ -413,10 +418,14 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
                                 instance.num_MPC_parties, L);
   RepContainer<GF> rep_shared_t(instance.num_repetitions,
                                 instance.num_MPC_parties, L);
+  RepContainer<GF> rep_shared_triple(instance.num_repetitions,
+                                     instance.num_MPC_parties, 3);
   std::vector<std::vector<uint8_t>> rep_key_deltas;
   rep_key_deltas.reserve(instance.num_repetitions);
   std::vector<std::vector<GF>> rep_t_deltas;
   rep_t_deltas.reserve(instance.num_repetitions);
+  std::vector<GF> rep_z_deltas;
+  rep_z_deltas.reserve(instance.num_repetitions);
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
@@ -535,19 +544,18 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
 
   // commit to the checking polynomials
 
-  // a vector of the first m2+1 field elements for interpolation
+  // a vector of the first L field elements for interpolation
   std::vector<GF> x_values_for_interpolation_zero_to_L =
-      field::get_first_n_field_elements<GF>(L + 1);
+      field::get_first_n_field_elements<GF>(L);
   std::vector<std::vector<GF>> precomputation_for_zero_to_L =
       field::precompute_lagrange_polynomials(
           x_values_for_interpolation_zero_to_L);
-  std::vector<GF> x_values_for_interpolation_zero_to_2L =
-      field::get_first_n_field_elements<GF>(2 * L + 1);
-  std::vector<std::vector<GF>> precomputation_for_zero_to_2L =
+  std::vector<GF> x_values_for_interpolation_zero_to_2L_min_1 =
+      field::get_first_n_field_elements<GF>(2 * L - 1);
+  std::vector<std::vector<GF>> precomputation_for_zero_to_2L_min_1 =
       field::precompute_lagrange_polynomials(
-          x_values_for_interpolation_zero_to_2L);
+          x_values_for_interpolation_zero_to_2L_min_1);
 
-  std::vector<std::vector<GF>> P_e(instance.num_repetitions);
   std::vector<std::vector<std::vector<GF>>> P_e_shares(
       instance.num_repetitions);
   std::vector<std::vector<std::vector<GF>>> S_e_shares(
@@ -557,23 +565,13 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
 
   std::vector<std::vector<GF>> P_deltas(instance.num_repetitions);
 
-  // polynomials for adjusting last S evaluation
-  std::vector<GF> last_lagrange = precomputation_for_zero_to_L[L];
-  std::vector<GF> last_lagrange_sq = last_lagrange * last_lagrange;
-
-  std::vector<GF> s_random_points(instance.num_repetitions),
-      t_random_points(instance.num_repetitions);
-
   // rearrange s-box values into polynomials
-  std::vector<GF> S_poly(L + 1);
-  std::vector<GF> T_poly(L + 1);
+  std::vector<GF> S_poly(L);
+  std::vector<GF> T_poly(L);
   for (size_t k = 0; k < L; k++) {
     S_poly[k] = sbox_pairs.first[k];
     T_poly[k] = sbox_pairs.second[k];
   }
-  // Leave last point to be 0
-  S_poly[L] = 0;
-  T_poly[L] = 0;
 
   // TODO template stuff
   S_poly = field::interpolate_with_precomputation(precomputation_for_zero_to_L,
@@ -582,57 +580,36 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
                                                   T_poly);
 
   // vectors of intermediate product polynomials for computing P
-  std::vector<GF> ST_product = S_poly * T_poly;
-  std::vector<GF> S_lag_product = S_poly * last_lagrange;
-  std::vector<GF> T_lag_product = T_poly * last_lagrange;
+  std::vector<GF> P_poly = S_poly * T_poly;
+  std::vector<GF> P_at_k(L - 1);
+  for (size_t k = L; k < 2 * L - 1; k++) {
+    GF k_element = x_values_for_interpolation_zero_to_2L_min_1[k];
+    P_at_k[k - L] = field::eval(P_poly, k_element);
+  }
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
 
-    P_deltas[repetition].resize(L + 1);
+    P_deltas[repetition].resize(L - 1);
     S_e_shares[repetition].resize(instance.num_MPC_parties);
     T_e_shares[repetition].resize(instance.num_MPC_parties);
 
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       auto shared_s = rep_shared_s.get(repetition, party);
       auto shared_t = rep_shared_t.get(repetition, party);
-      S_e_shares[repetition][party].resize(L + 1);
-      T_e_shares[repetition][party].resize(L + 1);
+      S_e_shares[repetition][party].resize(L);
+      T_e_shares[repetition][party].resize(L);
       for (size_t idx = 0; idx < L; idx++) {
         S_e_shares[repetition][party][idx] = shared_s[idx];
         T_e_shares[repetition][party][idx] = shared_t[idx];
       }
-
-      // sample additional random points
-      auto S_T_bar_shares = random_tapes.get_bytes(
-          repetition, party,
-          instance.block_cipher_params.key_size +
-              L * instance.block_cipher_params.block_size,
-          2 * instance.block_cipher_params.block_size);
-
-      S_e_shares[repetition][party][L].from_bytes(S_T_bar_shares.data());
-
-      T_e_shares[repetition][party][L].from_bytes(
-          S_T_bar_shares.data() + instance.block_cipher_params.block_size);
-
-      s_random_points[repetition] += S_e_shares[repetition][party][L];
-      t_random_points[repetition] += T_e_shares[repetition][party][L];
     }
-
-    // instead of doing the full polynomial multiplication of S and T
-    // with the random points added, we precomputed the part that
-    // does not depend on the random points in ST_product and then
-    // add the missing crossterms here
-    P_e[repetition] = ST_product + t_random_points[repetition] * S_lag_product +
-                      s_random_points[repetition] * T_lag_product +
-                      last_lagrange_sq * s_random_points[repetition] *
-                          t_random_points[repetition];
 
 #ifndef NDEBUG
     // sanity check, polynomial is 1 at the first L points
     for (size_t k = 0; k < L; k++)
-      assert(field::eval(P_e[repetition],
-                         x_values_for_interpolation_zero_to_L[k]) == GF(1));
+      assert(field::eval(P_poly, x_values_for_interpolation_zero_to_L[k]) ==
+             GF(1));
 #endif
 
     // compute sharing of P
@@ -640,7 +617,7 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     P_shares.resize(instance.num_MPC_parties);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       // first L points: first party = 1, other parties = 0
-      P_shares[party].resize(2 * L + 1);
+      P_shares[party].resize(2 * L - 1);
       if (party == 0) {
         for (size_t k = 0; k < L; k++) {
           P_shares[party][k] = GF(1);
@@ -651,23 +628,21 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
         }
       }
 
-      // second L+1 points: sample from random tape
+      // second L-1 points: sample from random tape
       auto random_P_shares = random_tapes.get_bytes(
           repetition, party,
           instance.block_cipher_params.key_size +
-              L * instance.block_cipher_params.block_size +
-              2 * instance.block_cipher_params.block_size,
-          (L + 1) * instance.block_cipher_params.block_size);
-      for (size_t k = L; k <= 2 * L; k++) {
+              L * instance.block_cipher_params.block_size,
+          (L - 1) * instance.block_cipher_params.block_size);
+      for (size_t k = L; k < 2 * L - 1; k++) {
         P_shares[party][k].from_bytes(
             random_P_shares.data() +
             (k - L) * instance.block_cipher_params.block_size);
       }
     }
-    for (size_t k = L; k <= 2 * L; k++) {
+    for (size_t k = L; k < 2 * L - 1; k++) {
       // calculate offset
-      GF k_element = x_values_for_interpolation_zero_to_2L[k];
-      GF P_at_k_delta = field::eval(P_e[repetition], k_element);
+      GF P_at_k_delta = P_at_k[k - L];
       for (size_t party = 0; party < instance.num_MPC_parties; party++) {
         P_at_k_delta -= P_shares[party][k];
       }
@@ -676,13 +651,36 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
       P_shares[0][k] += P_at_k_delta;
     }
 #ifndef NDEBUG
-    std::vector<GF> P_test(2 * L + 1);
+    std::vector<GF> P_test(2 * L - 1);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       P_test += field::interpolate_with_precomputation(
-          precomputation_for_zero_to_2L, P_e_shares[repetition][party]);
+          precomputation_for_zero_to_2L_min_1, P_e_shares[repetition][party]);
     }
-    assert(P_test == P_e[repetition]);
+    assert(P_test == P_poly);
 #endif
+    // also generate valid triple x,y,z and save z_delta
+    GF x(0), y(0), z(0);
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      auto random_triple_bytes = random_tapes.get_bytes(
+          repetition, party,
+          instance.block_cipher_params.key_size +
+              L * instance.block_cipher_params.block_size +
+              (L - 1) * instance.block_cipher_params.block_size,
+          (3) * instance.block_cipher_params.block_size);
+      auto triple_share = rep_shared_triple.get(repetition, party);
+      triple_share[0].from_bytes(random_triple_bytes.data());
+      triple_share[1].from_bytes(random_triple_bytes.data() +
+                                 instance.block_cipher_params.block_size);
+      triple_share[2].from_bytes(random_triple_bytes.data() +
+                                 2 * instance.block_cipher_params.block_size);
+      x += triple_share[0];
+      y += triple_share[1];
+      z += triple_share[2];
+    }
+    // calculate z_delta that fixes the multiplication triple
+    rep_z_deltas[repetition] = x * y - z;
+    // fix party 0's share
+    rep_shared_triple.get(repetition, 0)[2] += rep_z_deltas[repetition];
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -695,40 +693,45 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   std::vector<uint8_t> h_1 =
       phase_1_commitment(instance, salt, keypair.second, message, message_len,
                          party_seed_commitments, rep_output_broadcasts,
-                         rep_key_deltas, rep_t_deltas, P_deltas);
+                         rep_key_deltas, rep_t_deltas, rep_z_deltas, P_deltas);
 
   // expand challenge hash to tau values
+  // TODO: analysis, do we still need forbidden values?
   std::vector<GF> forbidden_challenge_values =
       field::get_first_n_field_elements<GF>(L);
-  std::vector<GF> R_es =
+  std::vector<std::pair<GF, GF>> R_eps_e =
       phase_1_expand(instance, h_1, forbidden_challenge_values);
 
   /////////////////////////////////////////////////////////////////////////////
   // phase 3: commit to the views of the checking protocol
   /////////////////////////////////////////////////////////////////////////////
 
-  std::vector<GF> a(instance.num_repetitions);
-  std::vector<GF> b(instance.num_repetitions);
-  std::vector<GF> c(instance.num_repetitions);
   std::vector<std::vector<GF>> a_shares(instance.num_repetitions);
   std::vector<std::vector<GF>> b_shares(instance.num_repetitions);
   std::vector<std::vector<GF>> c_shares(instance.num_repetitions);
 
-  std::vector<GF> lagrange_polys_evaluated_at_Re_L(L + 1);
-  std::vector<GF> lagrange_polys_evaluated_at_Re_2L(2 * L + 1);
+  std::vector<std::vector<GF>> alpha_shares(instance.num_repetitions);
+  std::vector<std::vector<GF>> beta_shares(instance.num_repetitions);
+  std::vector<std::vector<GF>> v_shares(instance.num_repetitions);
+
+  std::vector<GF> lagrange_polys_evaluated_at_Re_L(L);
+  std::vector<GF> lagrange_polys_evaluated_at_Re_2L(2 * L - 1);
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
     a_shares[repetition].resize(instance.num_MPC_parties);
     b_shares[repetition].resize(instance.num_MPC_parties);
     c_shares[repetition].resize(instance.num_MPC_parties);
-    for (size_t k = 0; k < L + 1; k++) {
-      lagrange_polys_evaluated_at_Re_L[k] =
-          field::eval(precomputation_for_zero_to_L[k], R_es[repetition]);
+    alpha_shares[repetition].resize(instance.num_MPC_parties);
+    beta_shares[repetition].resize(instance.num_MPC_parties);
+    v_shares[repetition].resize(instance.num_MPC_parties);
+    for (size_t k = 0; k < L; k++) {
+      lagrange_polys_evaluated_at_Re_L[k] = field::eval(
+          precomputation_for_zero_to_L[k], R_eps_e[repetition].first);
     }
-    for (size_t k = 0; k < 2 * L + 1; k++) {
-      lagrange_polys_evaluated_at_Re_2L[k] =
-          field::eval(precomputation_for_zero_to_2L[k], R_es[repetition]);
+    for (size_t k = 0; k < 2 * L - 1; k++) {
+      lagrange_polys_evaluated_at_Re_2L[k] = field::eval(
+          precomputation_for_zero_to_2L_min_1[k], R_eps_e[repetition].first);
     }
 
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
@@ -742,20 +745,66 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
       c_shares[repetition][party] = dot_product(
           lagrange_polys_evaluated_at_Re_2L, P_e_shares[repetition][party]);
     }
-    // open a,b and c values
+
+    auto triple = rep_shared_triple.get_repetition(repetition);
+
+#ifndef NDEBUG
+    // sanity check: a*b=c
+    GF a(0), b(0), c(0);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      a[repetition] += a_shares[repetition][party];
-      b[repetition] += b_shares[repetition][party];
-      c[repetition] += c_shares[repetition][party];
+      a += a_shares[repetition][party];
+      b += b_shares[repetition][party];
+      c += c_shares[repetition][party];
     }
+    assert(a * b == c);
+    // sanity check: x*y=z
+    GF x(0), y(0), z(0);
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      x += triple[party][0];
+      y += triple[party][1];
+      z += triple[party][2];
+    }
+    assert(x * y == z);
+#endif
+
+    // execute sacrificing check protocol
+    // alpha^i = eps * a^i + x^i
+    // beta^i = b^i + y^i
+    GF alpha(0), beta(0);
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      alpha_shares[repetition][party] =
+          a_shares[repetition][party] * R_eps_e[repetition].second +
+          triple[party][0];
+      beta_shares[repetition][party] =
+          b_shares[repetition][party] + triple[party][1];
+      alpha += alpha_shares[repetition][party];
+      beta += beta_shares[repetition][party];
+    }
+    // v^i = eps * c^i - z^i + alpha*y^i + beta*x^i - alpha*beta
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      v_shares[repetition][party] =
+          R_eps_e[repetition].second * c_shares[repetition][party] -
+          triple[party][2] + alpha * triple[party][1] + beta * triple[party][0];
+    }
+    v_shares[repetition][0] -= alpha * beta;
+#ifndef NDEBUG
+    assert(alpha == R_eps_e[repetition].second * a + x);
+    assert(beta == b + y);
+    // sanity check: vs are zero
+    GF v(0);
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      v += v_shares[repetition][party];
+    }
+    assert(v == GF(0));
+#endif
   }
 
   /////////////////////////////////////////////////////////////////////////////
   // phase 4: challenge the views of the checking protocol
   /////////////////////////////////////////////////////////////////////////////
 
-  std::vector<uint8_t> h_2 = phase_2_commitment(instance, salt, h_1, a, b, c,
-                                                a_shares, b_shares, c_shares);
+  std::vector<uint8_t> h_2 = phase_2_commitment(
+      instance, salt, h_1, alpha_shares, beta_shares, v_shares);
 
   std::vector<uint16_t> missing_parties = phase_2_expand(instance, h_2);
 
@@ -784,14 +833,10 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
         rep_key_deltas[repetition],
         rep_t_deltas[repetition],
         P_deltas[repetition],
-        a[repetition],
-        b[repetition],
+        rep_z_deltas[repetition],
+        alpha_shares[repetition][missing_party],
+        beta_shares[repetition][missing_party],
     };
-#ifndef NDEBUG
-    // sanity check c = a*b
-    if (a[repetition] * b[repetition] != c[repetition])
-      throw std::runtime_error("final sanity check is wrong");
-#endif
     proofs.push_back(proof);
   }
 
@@ -817,14 +862,13 @@ bool rainier_verify_template(const signature_instance_t &instance,
   // do parallel repetitions
   // create seed trees and random tapes
   std::vector<SeedTree> seed_trees;
-  // key share + L*T_share + s_bar + t_bar + (L+1) * P_share
+  // key share + L*T_share + x_share + y_share + z_share + (L-1) *
+  // P_share
   const size_t random_tape_size =
       instance.block_cipher_params.key_size +
-      instance.block_cipher_params.num_sboxes *
-          instance.block_cipher_params.block_size +
-      2 * instance.block_cipher_params.block_size +
-      (instance.block_cipher_params.num_sboxes + 1) *
-          instance.block_cipher_params.block_size;
+      L * instance.block_cipher_params.block_size +
+      3 * instance.block_cipher_params.block_size +
+      (L - 1) * instance.block_cipher_params.block_size;
 
   RandomTapes random_tapes(instance.num_repetitions, instance.num_MPC_parties,
                            random_tape_size);
@@ -834,7 +878,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
   // h1 expansion
   std::vector<GF> forbidden_challenge_values =
       field::get_first_n_field_elements<GF>(L);
-  std::vector<GF> R_es =
+  std::vector<std::pair<GF, GF>> R_eps_e =
       phase_1_expand(instance, signature.h_1, forbidden_challenge_values);
   // h2 expansion already happened in deserialize to get missing parties
   std::vector<uint16_t> missing_parties =
@@ -911,6 +955,8 @@ bool rainier_verify_template(const signature_instance_t &instance,
   RepContainer<GF> rep_shared_t(instance.num_repetitions,
                                 instance.num_MPC_parties,
                                 instance.block_cipher_params.num_sboxes);
+  RepContainer<GF> rep_shared_triple(instance.num_repetitions,
+                                     instance.num_MPC_parties, 3);
   RepByteContainer rep_output_broadcasts(
       instance.num_repetitions, instance.num_MPC_parties,
       instance.block_cipher_params.block_size);
@@ -1015,15 +1061,15 @@ bool rainier_verify_template(const signature_instance_t &instance,
   /////////////////////////////////////////////////////////////////////////////
   // a vector of the first m2+1 field elements for interpolation
   std::vector<GF> x_values_for_interpolation_zero_to_L =
-      field::get_first_n_field_elements<GF>(L + 1);
+      field::get_first_n_field_elements<GF>(L);
   std::vector<std::vector<GF>> precomputation_for_zero_to_L =
       field::precompute_lagrange_polynomials(
           x_values_for_interpolation_zero_to_L);
-  std::vector<GF> x_values_for_interpolation_zero_to_2L =
-      field::get_first_n_field_elements<GF>(2 * L + 1);
-  std::vector<std::vector<GF>> precomputation_for_zero_to_2L =
+  std::vector<GF> x_values_for_interpolation_zero_to_2L_min_1 =
+      field::get_first_n_field_elements<GF>(2 * L - 1);
+  std::vector<std::vector<GF>> precomputation_for_zero_to_2L_min_1 =
       field::precompute_lagrange_polynomials(
-          x_values_for_interpolation_zero_to_2L);
+          x_values_for_interpolation_zero_to_2L_min_1);
 
   std::vector<std::vector<GF>> P_e(instance.num_repetitions);
   std::vector<std::vector<std::vector<GF>>> P_e_shares(
@@ -1041,26 +1087,14 @@ bool rainier_verify_template(const signature_instance_t &instance,
 
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_parties[repetition]) {
-        S_e_shares[repetition][party].resize(L + 1);
-        T_e_shares[repetition][party].resize(L + 1);
+        S_e_shares[repetition][party].resize(L);
+        T_e_shares[repetition][party].resize(L);
         auto shared_s = rep_shared_s.get(repetition, party);
         auto shared_t = rep_shared_t.get(repetition, party);
         for (size_t idx = 0; idx < L; idx++) {
           S_e_shares[repetition][party][idx] = shared_s[idx];
           T_e_shares[repetition][party][idx] = shared_t[idx];
         }
-
-        // sample additional random points
-        auto S_T_bar_shares = random_tapes.get_bytes(
-            repetition, party,
-            instance.block_cipher_params.key_size +
-                L * instance.block_cipher_params.block_size,
-            2 * instance.block_cipher_params.block_size);
-
-        S_e_shares[repetition][party][L].from_bytes(S_T_bar_shares.data());
-
-        T_e_shares[repetition][party][L].from_bytes(
-            S_T_bar_shares.data() + instance.block_cipher_params.block_size);
       }
     }
 
@@ -1070,7 +1104,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_parties[repetition]) {
         // first m2 points: first party = 1, other parties = 0
-        P_shares[party].resize(2 * L + 1);
+        P_shares[party].resize(2 * L - 1);
         if (party == 0) {
           for (size_t k = 0; k < L; k++) {
             P_shares[party][k] = GF(1);
@@ -1081,14 +1115,13 @@ bool rainier_verify_template(const signature_instance_t &instance,
           }
         }
 
-        // second m2+1 points: sample from random tape
+        // second L-1 points: sample from random tape
         auto random_P_shares = random_tapes.get_bytes(
             repetition, party,
             instance.block_cipher_params.key_size +
-                L * instance.block_cipher_params.block_size +
-                2 * instance.block_cipher_params.block_size,
-            (L + 1) * instance.block_cipher_params.block_size);
-        for (size_t k = L; k <= 2 * L; k++) {
+                L * instance.block_cipher_params.block_size,
+            (L - 1) * instance.block_cipher_params.block_size);
+        for (size_t k = L; k < 2 * L - 1; k++) {
           P_shares[party][k].from_bytes(
               random_P_shares.data() +
               (k - L) * instance.block_cipher_params.block_size);
@@ -1096,49 +1129,68 @@ bool rainier_verify_template(const signature_instance_t &instance,
       }
     }
     if (0 != missing_parties[repetition]) {
-      for (size_t k = L; k <= 2 * L; k++) {
+      for (size_t k = L; k < 2 * L - 1; k++) {
         // adjust first share with delta from signature
         P_shares[0][k] += proof.P_delta[k - L];
       }
     }
-    // for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-    //// iterpolate polynomial P_e^1 from 2m+1 points
-    // if (party != missing_parties[repetition]) {
-    // P_ei[repetition][party] = utils::interpolate_with_precomputation(
-    // precomputation_for_zero_to_2L, P_shares[party]);
-    //}
-    //}
+    // also generate valid triple x,y,z and save z_delta
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      if (party != missing_parties[repetition]) {
+        auto random_triple_bytes = random_tapes.get_bytes(
+            repetition, party,
+            instance.block_cipher_params.key_size +
+                L * instance.block_cipher_params.block_size +
+                (L - 1) * instance.block_cipher_params.block_size,
+            3 * instance.block_cipher_params.block_size);
+        auto triple_share = rep_shared_triple.get(repetition, party);
+        triple_share[0].from_bytes(random_triple_bytes.data());
+        triple_share[1].from_bytes(random_triple_bytes.data() +
+                                   instance.block_cipher_params.block_size);
+        triple_share[2].from_bytes(random_triple_bytes.data() +
+                                   2 * instance.block_cipher_params.block_size);
+      }
+    }
+    // fix party 0's share
+    if (0 != missing_parties[repetition]) {
+      // adjust first share with delta from signature
+      rep_shared_triple.get(repetition, 0)[2] += proof.z_delta;
+    }
   }
 
   /////////////////////////////////////////////////////////////////////////////
   // recompute views of polynomial checks
   /////////////////////////////////////////////////////////////////////////////
-  std::vector<GF> a(instance.num_repetitions);
-  std::vector<GF> b(instance.num_repetitions);
-  std::vector<GF> c(instance.num_repetitions);
   std::vector<std::vector<GF>> a_shares(instance.num_repetitions);
   std::vector<std::vector<GF>> b_shares(instance.num_repetitions);
   std::vector<std::vector<GF>> c_shares(instance.num_repetitions);
 
-  std::vector<GF> lagrange_polys_evaluated_at_Re_L(L + 1);
-  std::vector<GF> lagrange_polys_evaluated_at_Re_2L(2 * L + 1);
+  std::vector<std::vector<GF>> alpha_shares(instance.num_repetitions);
+  std::vector<std::vector<GF>> beta_shares(instance.num_repetitions);
+  std::vector<std::vector<GF>> v_shares(instance.num_repetitions);
+
+  std::vector<GF> lagrange_polys_evaluated_at_Re_L(L);
+  std::vector<GF> lagrange_polys_evaluated_at_Re_2L(2 * L - 1);
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
     const repetition_proof_t<GF> &proof = signature.proofs[repetition];
     size_t missing_party = missing_parties[repetition];
 
-    for (size_t k = 0; k < L + 1; k++) {
-      lagrange_polys_evaluated_at_Re_L[k] =
-          field::eval(precomputation_for_zero_to_L[k], R_es[repetition]);
+    for (size_t k = 0; k < L; k++) {
+      lagrange_polys_evaluated_at_Re_L[k] = field::eval(
+          precomputation_for_zero_to_L[k], R_eps_e[repetition].first);
     }
-    for (size_t k = 0; k < 2 * L + 1; k++) {
-      lagrange_polys_evaluated_at_Re_2L[k] =
-          field::eval(precomputation_for_zero_to_2L[k], R_es[repetition]);
+    for (size_t k = 0; k < 2 * L - 1; k++) {
+      lagrange_polys_evaluated_at_Re_2L[k] = field::eval(
+          precomputation_for_zero_to_2L_min_1[k], R_eps_e[repetition].first);
     }
 
     a_shares[repetition].resize(instance.num_MPC_parties);
     b_shares[repetition].resize(instance.num_MPC_parties);
     c_shares[repetition].resize(instance.num_MPC_parties);
+    alpha_shares[repetition].resize(instance.num_MPC_parties);
+    beta_shares[repetition].resize(instance.num_MPC_parties);
+    v_shares[repetition].resize(instance.num_MPC_parties);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_party) {
         // compute a_ej^i and b_ej^i
@@ -1151,19 +1203,39 @@ bool rainier_verify_template(const signature_instance_t &instance,
             lagrange_polys_evaluated_at_Re_2L, P_e_shares[repetition][party]);
       }
     }
-
-    // calculate missing shares
-    a[repetition] = proof.S_at_R;
-    b[repetition] = proof.T_at_R;
-    c[repetition] = proof.S_at_R * proof.T_at_R;
-    a_shares[repetition][missing_party] = proof.S_at_R;
-    b_shares[repetition][missing_party] = proof.T_at_R;
-    c_shares[repetition][missing_party] = c[repetition];
+    auto triple = rep_shared_triple.get_repetition(repetition);
+    GF alpha(0), beta(0);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_party) {
-        a_shares[repetition][missing_party] -= a_shares[repetition][party];
-        b_shares[repetition][missing_party] -= b_shares[repetition][party];
-        c_shares[repetition][missing_party] -= c_shares[repetition][party];
+        alpha_shares[repetition][party] =
+            a_shares[repetition][party] * R_eps_e[repetition].second -
+            triple[party][0];
+        beta_shares[repetition][party] =
+            b_shares[repetition][party] - triple[party][1];
+        alpha += alpha_shares[repetition][party];
+        beta += beta_shares[repetition][party];
+      }
+    }
+    // fill missing shares
+    alpha_shares[repetition][missing_party] = proof.missing_alpha_share;
+    beta_shares[repetition][missing_party] = proof.missing_beta_share;
+    alpha += proof.missing_alpha_share;
+    beta += proof.missing_beta_share;
+    // v^i = eps * c^i + z^i - alpha*y^i - beta*x^i - alpha*beta
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      if (party != missing_party) {
+        v_shares[repetition][party] =
+            R_eps_e[repetition].second * c_shares[repetition][party] +
+            triple[party][2] - alpha * triple[party][1] -
+            beta * triple[party][0];
+      }
+    }
+    // calculate missing shares as 0 - sum_{i!=missing} v^i
+    if (missing_party != 0)
+      v_shares[repetition][0] -= alpha * beta;
+    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      if (party != missing_party) {
+        v_shares[repetition][missing_party] -= v_shares[repetition][party];
       }
     }
   }
@@ -1173,21 +1245,24 @@ bool rainier_verify_template(const signature_instance_t &instance,
   std::vector<std::vector<uint8_t>> sk_deltas;
   std::vector<std::vector<GF>> t_deltas;
   std::vector<std::vector<GF>> P_deltas;
+  std::vector<GF> z_deltas;
   sk_deltas.reserve(instance.num_repetitions);
   t_deltas.reserve(instance.num_repetitions);
   P_deltas.reserve(instance.num_repetitions);
+  z_deltas.reserve(instance.num_repetitions);
   for (const repetition_proof_t<GF> &proof : signature.proofs) {
     sk_deltas.push_back(proof.sk_delta);
     t_deltas.push_back(proof.t_delta);
     P_deltas.push_back(proof.P_delta);
+    z_deltas.push_back(proof.z_delta);
   }
   std::vector<uint8_t> h_1 =
       phase_1_commitment(instance, signature.salt, pk, message, message_len,
                          party_seed_commitments, rep_output_broadcasts,
-                         sk_deltas, t_deltas, P_deltas);
+                         sk_deltas, t_deltas, z_deltas, P_deltas);
 
   std::vector<uint8_t> h_2 = phase_2_commitment(
-      instance, signature.salt, h_1, a, b, c, a_shares, b_shares, c_shares);
+      instance, signature.salt, h_1, alpha_shares, beta_shares, v_shares);
   // do checks
   if (memcmp(h_1.data(), signature.h_1.data(), h_1.size()) != 0) {
     return false;
@@ -1215,9 +1290,10 @@ rainier_serialize_signature(const signature_instance_t &instance,
            instance.block_cipher_params.key_size + // delta sk
            instance.block_cipher_params.block_size *
                instance.block_cipher_params.num_sboxes + // delta t
-           (instance.block_cipher_params.num_sboxes + 1) *
+           (instance.block_cipher_params.num_sboxes - 1) *
                instance.block_cipher_params.block_size + // delta P
-           instance.block_cipher_params.block_size * 2); // S(R) + T(R)
+           instance.block_cipher_params.block_size +     // delta z
+           instance.block_cipher_params.block_size * 2); // alpha, beta
   serialized.reserve(signature_size);
 
   serialized.insert(serialized.end(), signature.salt.begin(),
@@ -1245,16 +1321,21 @@ rainier_serialize_signature(const signature_instance_t &instance,
     }
     current_size = serialized.size();
     serialized.resize(current_size +
-                      (instance.block_cipher_params.num_sboxes + 1) *
+                      (instance.block_cipher_params.num_sboxes - 1) *
                           GF::BYTE_SIZE);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes + 1; k++) {
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
       proof.P_delta[k].to_bytes(serialized.data() + current_size +
                                 k * GF::BYTE_SIZE);
     }
     current_size = serialized.size();
+    serialized.resize(current_size + GF::BYTE_SIZE);
+    proof.z_delta.to_bytes(serialized.data() + current_size);
+    current_size = serialized.size();
+
     serialized.resize(current_size + 2 * GF::BYTE_SIZE);
-    proof.S_at_R.to_bytes(serialized.data() + current_size);
-    proof.T_at_R.to_bytes(serialized.data() + current_size + GF::BYTE_SIZE);
+    proof.missing_alpha_share.to_bytes(serialized.data() + current_size);
+    proof.missing_beta_share.to_bytes(serialized.data() + current_size +
+                                      GF::BYTE_SIZE);
   }
   // calculation as expected
   assert(signature_size == serialized.size());
@@ -1310,21 +1391,25 @@ rainier_deserialize_signature(const signature_instance_t &instance,
     }
 
     std::vector<GF> P_delta;
-    P_delta.reserve(instance.block_cipher_params.num_sboxes + 1);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes + 1; k++) {
+    P_delta.reserve(instance.block_cipher_params.num_sboxes - 1);
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
       tmp.from_bytes(serialized.data() + current_offset);
       current_offset += GF::BYTE_SIZE;
       P_delta.push_back(tmp);
     }
-    GF S_at_R;
-    S_at_R.from_bytes(serialized.data() + current_offset);
+    GF z_delta;
+    z_delta.from_bytes(serialized.data() + current_offset);
     current_offset += GF::BYTE_SIZE;
-    GF T_at_R;
-    T_at_R.from_bytes(serialized.data() + current_offset);
+    GF missing_alpha_share;
+    missing_alpha_share.from_bytes(serialized.data() + current_offset);
+    current_offset += GF::BYTE_SIZE;
+    GF missing_beta_share;
+    missing_beta_share.from_bytes(serialized.data() + current_offset);
     current_offset += GF::BYTE_SIZE;
 
     proofs.emplace_back(repetition_proof_t<GF>{
-        reveallist, Com_e, sk_delta, t_delta, P_delta, S_at_R, T_at_R});
+        reveallist, Com_e, sk_delta, t_delta, P_delta, z_delta,
+        missing_alpha_share, missing_beta_share});
   }
   assert(current_offset == serialized.size());
   signature_t<GF> signature{salt, h_1, h_2, proofs};

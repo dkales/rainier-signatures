@@ -31,8 +31,9 @@ template <typename GF> struct repetition_proof_t {
   std::vector<uint8_t> sk_delta;
   std::vector<GF> t_delta;
   std::vector<GF> P_delta;
-  GF S_at_R;
-  GF T_at_R;
+  GF z_delta;
+  GF missing_alpha_share;
+  GF missing_beta_share;
 };
 
 template <typename GF> struct signature_t {
