@@ -30,10 +30,8 @@ template <typename GF> struct repetition_proof_t {
   std::vector<uint8_t> Com_e;
   std::vector<uint8_t> sk_delta;
   std::vector<GF> t_delta;
-  std::vector<GF> P_delta;
-  GF z_delta;
-  GF missing_alpha_share;
-  GF missing_beta_share;
+  std::vector<GF> missing_alpha_shares;
+  GF c_delta;
 };
 
 template <typename GF> struct signature_t {

@@ -64,6 +64,7 @@ static void bench_sign_and_verify_free(const bench_options_free_t *options) {
   default:
     printf("invalid kappa, choose 16,24,32\n");
   }
+  instance.params = PARAMETER_SET_INVALID;
   instance.num_MPC_parties = options->N;
   instance.num_repetitions = options->tau;
   printf("Instance: N=%d, tau=%d, Seclvl=%d\n", instance.num_MPC_parties,

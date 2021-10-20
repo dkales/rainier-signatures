@@ -93,8 +93,7 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
                    const RepByteContainer &output_broadcasts,
                    const std::vector<std::vector<uint8_t>> &key_deltas,
                    const std::vector<std::vector<GF>> &t_deltas,
-                   const std::vector<GF> &z_deltas,
-                   const std::vector<std::vector<GF>> &P_deltas) {
+                   const std::vector<GF> &c_deltas) {
 
   hash_context ctx;
   hash_init_prefix(&ctx, instance.digest_size, HASH_PREFIX_1);
@@ -115,10 +114,7 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
     for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
       hash_update_GF2E(&ctx, instance, t_deltas[repetition][ell]);
     }
-    hash_update_GF2E(&ctx, instance, z_deltas[repetition]);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
-      hash_update_GF2E(&ctx, instance, P_deltas[repetition][k]);
-    }
+    hash_update_GF2E(&ctx, instance, c_deltas[repetition]);
   }
   hash_final(&ctx);
 
@@ -127,52 +123,33 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
   return commitment;
 }
 
-// returns pairs of R,\epsion values
+// returns vecs of \epsilon values
 template <typename GF>
-std::vector<std::pair<GF, GF>>
+std::vector<std::vector<GF>>
 phase_1_expand(const signature_instance_t &instance,
-               const std::vector<uint8_t> &h_1,
-               const std::vector<GF> &forbidden_values) {
+               const std::vector<uint8_t> &h_1) {
   hash_context ctx;
   hash_init(&ctx, instance.digest_size);
   hash_update(&ctx, h_1.data(), h_1.size());
   hash_final(&ctx);
 
   std::array<uint8_t, GF::BYTE_SIZE> buffer;
-  std::vector<std::pair<GF, GF>> R_eps;
-  R_eps.reserve(instance.num_repetitions);
+  std::vector<std::vector<GF>> epsilons(instance.num_repetitions);
   for (size_t e = 0; e < instance.num_repetitions; e++) {
-    while (true) {
+    epsilons[e].resize(instance.block_cipher_params.num_sboxes);
+    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
       hash_squeeze(&ctx, buffer.data(), buffer.size());
-      //  check that R is not in {0,...2L-1}
-      GF candidate_R;
-      candidate_R.from_bytes(buffer.data());
-      bool good = true;
-      for (size_t k = 0; k < instance.block_cipher_params.num_sboxes; k++) {
-        if (candidate_R == forbidden_values[k]) {
-          good = false;
-          break;
-        }
-      }
-      if (good) {
-        hash_squeeze(&ctx, buffer.data(), buffer.size());
-        GF eps;
-        // eps does not have restrictions
-        eps.from_bytes(buffer.data());
-        R_eps.push_back(std::make_pair(candidate_R, eps));
-        break;
-      }
+      epsilons[e][ell].from_bytes(buffer.data());
     }
   }
-  return R_eps;
+  return epsilons;
 }
 
 template <typename GF>
 std::vector<uint8_t>
 phase_2_commitment(const signature_instance_t &instance, const salt_t &salt,
                    const std::vector<uint8_t> &h_1,
-                   const std::vector<std::vector<GF>> &alpha_shares,
-                   const std::vector<std::vector<GF>> &beta_shares,
+                   const RepContainer<GF> &alpha_shares,
                    const std::vector<std::vector<GF>> &v_shares) {
 
   hash_context ctx;
@@ -183,8 +160,11 @@ phase_2_commitment(const signature_instance_t &instance, const salt_t &salt,
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      hash_update_GF2E(&ctx, instance, alpha_shares[repetition][party]);
-      hash_update_GF2E(&ctx, instance, beta_shares[repetition][party]);
+      for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes;
+           ell++) {
+        hash_update_GF2E(&ctx, instance,
+                         alpha_shares.get(repetition, party)[ell]);
+      }
       hash_update_GF2E(&ctx, instance, v_shares[repetition][party]);
     }
   }
@@ -330,7 +310,7 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   assert(ct == ct2);
 
 #ifndef NDEBUG
-  for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
+  for (size_t ell = 0; ell < L; ell++) {
     assert(sbox_pairs.first[ell] * sbox_pairs.second[ell] == GF(1));
   }
 #endif
@@ -343,15 +323,10 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   // create seed trees and random tapes
   std::vector<SeedTree> seed_trees;
   seed_trees.reserve(instance.num_repetitions);
-  // key share + L*T_share + x_share + y_share + z_share + (L-1) *
-  // P_share
-  const size_t random_tape_size =
-      instance.block_cipher_params.key_size +
-      instance.block_cipher_params.num_sboxes *
-          instance.block_cipher_params.block_size +
-      3 * instance.block_cipher_params.block_size +
-      (instance.block_cipher_params.num_sboxes - 1) *
-          instance.block_cipher_params.block_size;
+  // key share + L*T_share + L * a_share + z_share
+  const size_t random_tape_size = instance.block_cipher_params.key_size +
+                                  L * GF::BYTE_SIZE + L * GF::BYTE_SIZE +
+                                  GF::BYTE_SIZE;
 
   RandomTapes random_tapes(instance.num_repetitions, instance.num_MPC_parties,
                            random_tape_size);
@@ -418,14 +393,17 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
                                 instance.num_MPC_parties, L);
   RepContainer<GF> rep_shared_t(instance.num_repetitions,
                                 instance.num_MPC_parties, L);
-  RepContainer<GF> rep_shared_triple(instance.num_repetitions,
-                                     instance.num_MPC_parties, 3);
   std::vector<std::vector<uint8_t>> rep_key_deltas;
   rep_key_deltas.reserve(instance.num_repetitions);
   std::vector<std::vector<GF>> rep_t_deltas;
   rep_t_deltas.reserve(instance.num_repetitions);
-  std::vector<GF> rep_z_deltas;
-  rep_z_deltas.reserve(instance.num_repetitions);
+
+  RepContainer<GF> rep_shared_dot_a(instance.num_repetitions,
+                                    instance.num_MPC_parties, L);
+  RepContainer<GF> rep_shared_dot_c(instance.num_repetitions,
+                                    instance.num_MPC_parties, 1);
+  std::vector<GF> rep_c_deltas;
+  rep_c_deltas.reserve(instance.num_repetitions);
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
@@ -542,145 +520,36 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     rep_t_deltas.push_back(t_deltas);
   }
 
-  // commit to the checking polynomials
-
-  // a vector of the first L field elements for interpolation
-  std::vector<GF> x_values_for_interpolation_zero_to_L =
-      field::get_first_n_field_elements<GF>(L);
-  std::vector<std::vector<GF>> precomputation_for_zero_to_L =
-      field::precompute_lagrange_polynomials(
-          x_values_for_interpolation_zero_to_L);
-  std::vector<GF> x_values_for_interpolation_zero_to_2L_min_1 =
-      field::get_first_n_field_elements<GF>(2 * L - 1);
-  std::vector<std::vector<GF>> precomputation_for_zero_to_2L_min_1 =
-      field::precompute_lagrange_polynomials(
-          x_values_for_interpolation_zero_to_2L_min_1);
-
-  std::vector<std::vector<std::vector<GF>>> P_e_shares(
-      instance.num_repetitions);
-  std::vector<std::vector<std::vector<GF>>> S_e_shares(
-      instance.num_repetitions);
-  std::vector<std::vector<std::vector<GF>>> T_e_shares(
-      instance.num_repetitions);
-
-  std::vector<std::vector<GF>> P_deltas(instance.num_repetitions);
-
-  // rearrange s-box values into polynomials
-  std::vector<GF> S_poly(L);
-  std::vector<GF> T_poly(L);
-  for (size_t k = 0; k < L; k++) {
-    S_poly[k] = sbox_pairs.first[k];
-    T_poly[k] = sbox_pairs.second[k];
-  }
-
-  // TODO template stuff
-  S_poly = field::interpolate_with_precomputation(precomputation_for_zero_to_L,
-                                                  S_poly);
-  T_poly = field::interpolate_with_precomputation(precomputation_for_zero_to_L,
-                                                  T_poly);
-
-  // vectors of intermediate product polynomials for computing P
-  std::vector<GF> P_poly = S_poly * T_poly;
-  std::vector<GF> P_at_k(L - 1);
-  for (size_t k = L; k < 2 * L - 1; k++) {
-    GF k_element = x_values_for_interpolation_zero_to_2L_min_1[k];
-    P_at_k[k - L] = field::eval(P_poly, k_element);
-  }
-
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
 
-    P_deltas[repetition].resize(L - 1);
-    S_e_shares[repetition].resize(instance.num_MPC_parties);
-    T_e_shares[repetition].resize(instance.num_MPC_parties);
-
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      auto shared_s = rep_shared_s.get(repetition, party);
-      auto shared_t = rep_shared_t.get(repetition, party);
-      S_e_shares[repetition][party].resize(L);
-      T_e_shares[repetition][party].resize(L);
-      for (size_t idx = 0; idx < L; idx++) {
-        S_e_shares[repetition][party][idx] = shared_s[idx];
-        T_e_shares[repetition][party][idx] = shared_t[idx];
-      }
-    }
-
-#ifndef NDEBUG
-    // sanity check, polynomial is 1 at the first L points
-    for (size_t k = 0; k < L; k++)
-      assert(field::eval(P_poly, x_values_for_interpolation_zero_to_L[k]) ==
-             GF(1));
-#endif
-
-    // compute sharing of P
-    std::vector<std::vector<GF>> &P_shares = P_e_shares[repetition];
-    P_shares.resize(instance.num_MPC_parties);
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      // first L points: first party = 1, other parties = 0
-      P_shares[party].resize(2 * L - 1);
-      if (party == 0) {
-        for (size_t k = 0; k < L; k++) {
-          P_shares[party][k] = GF(1);
-        }
-      } else {
-        for (size_t k = 0; k < L; k++) {
-          P_shares[party][k] = GF(0);
-        }
-      }
-
-      // second L-1 points: sample from random tape
-      auto random_P_shares = random_tapes.get_bytes(
-          repetition, party,
-          instance.block_cipher_params.key_size +
-              L * instance.block_cipher_params.block_size,
-          (L - 1) * instance.block_cipher_params.block_size);
-      for (size_t k = L; k < 2 * L - 1; k++) {
-        P_shares[party][k].from_bytes(
-            random_P_shares.data() +
-            (k - L) * instance.block_cipher_params.block_size);
-      }
-    }
-    for (size_t k = L; k < 2 * L - 1; k++) {
-      // calculate offset
-      GF P_at_k_delta = P_at_k[k - L];
-      for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-        P_at_k_delta -= P_shares[party][k];
-      }
-      P_deltas[repetition][k - L] = P_at_k_delta;
-      // adjust first share
-      P_shares[0][k] += P_at_k_delta;
-    }
-#ifndef NDEBUG
-    std::vector<GF> P_test(2 * L - 1);
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      P_test += field::interpolate_with_precomputation(
-          precomputation_for_zero_to_2L_min_1, P_e_shares[repetition][party]);
-    }
-    assert(P_test == P_poly);
-#endif
-    // also generate valid triple x,y,z and save z_delta
-    GF x(0), y(0), z(0);
+    // also generate valid dot triple a,t,c and save c_delta
+    std::vector<GF> a(L);
+    GF c(0);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       auto random_triple_bytes = random_tapes.get_bytes(
           repetition, party,
-          instance.block_cipher_params.key_size +
-              L * instance.block_cipher_params.block_size +
-              (L - 1) * instance.block_cipher_params.block_size,
-          (3) * instance.block_cipher_params.block_size);
-      auto triple_share = rep_shared_triple.get(repetition, party);
-      triple_share[0].from_bytes(random_triple_bytes.data());
-      triple_share[1].from_bytes(random_triple_bytes.data() +
-                                 instance.block_cipher_params.block_size);
-      triple_share[2].from_bytes(random_triple_bytes.data() +
-                                 2 * instance.block_cipher_params.block_size);
-      x += triple_share[0];
-      y += triple_share[1];
-      z += triple_share[2];
+          instance.block_cipher_params.key_size + L * GF::BYTE_SIZE,
+          (L + 1) * GF::BYTE_SIZE);
+      auto a_share = rep_shared_dot_a.get(repetition, party);
+      for (size_t ell = 0; ell < L; ell++) {
+        a_share[ell].from_bytes(random_triple_bytes.data() +
+                                GF::BYTE_SIZE * ell);
+        a[ell] += a_share[ell];
+      }
+      auto c_share = rep_shared_dot_c.get(repetition, party);
+      c_share[0].from_bytes(random_triple_bytes.data() + GF::BYTE_SIZE * L);
+      c -= c_share[0];
     }
-    // calculate z_delta that fixes the multiplication triple
-    rep_z_deltas[repetition] = x * y - z;
+
+    // calculate c_delta = -c + a*t, c is negated above already
+    for (size_t ell = 0; ell < L; ell++) {
+      c += a[ell] * sbox_pairs.second[ell];
+    }
+    // calculate c_delta that fixes the dot triple
+    rep_c_deltas[repetition] = c;
     // fix party 0's share
-    rep_shared_triple.get(repetition, 0)[2] += rep_z_deltas[repetition];
+    rep_shared_dot_c.get(repetition, 0)[0] += rep_c_deltas[repetition];
   }
 
   /////////////////////////////////////////////////////////////////////////////
@@ -693,103 +562,72 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   std::vector<uint8_t> h_1 =
       phase_1_commitment(instance, salt, keypair.second, message, message_len,
                          party_seed_commitments, rep_output_broadcasts,
-                         rep_key_deltas, rep_t_deltas, rep_z_deltas, P_deltas);
+                         rep_key_deltas, rep_t_deltas, rep_c_deltas);
 
-  // expand challenge hash to tau values
-  // TODO: analysis, do we still need forbidden values?
-  std::vector<GF> forbidden_challenge_values =
-      field::get_first_n_field_elements<GF>(L);
-  std::vector<std::pair<GF, GF>> R_eps_e =
-      phase_1_expand(instance, h_1, forbidden_challenge_values);
+  // expand challenge hash to epsilon values
+  std::vector<std::vector<GF>> epsilons = phase_1_expand<GF>(instance, h_1);
 
   /////////////////////////////////////////////////////////////////////////////
   // phase 3: commit to the views of the checking protocol
   /////////////////////////////////////////////////////////////////////////////
 
-  std::vector<std::vector<GF>> a_shares(instance.num_repetitions);
-  std::vector<std::vector<GF>> b_shares(instance.num_repetitions);
-  std::vector<std::vector<GF>> c_shares(instance.num_repetitions);
-
-  std::vector<std::vector<GF>> alpha_shares(instance.num_repetitions);
-  std::vector<std::vector<GF>> beta_shares(instance.num_repetitions);
+  RepContainer<GF> rep_alpha_shares(instance.num_repetitions,
+                                    instance.num_MPC_parties, L);
   std::vector<std::vector<GF>> v_shares(instance.num_repetitions);
-
-  std::vector<GF> lagrange_polys_evaluated_at_Re_L(L);
-  std::vector<GF> lagrange_polys_evaluated_at_Re_2L(2 * L - 1);
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
-    a_shares[repetition].resize(instance.num_MPC_parties);
-    b_shares[repetition].resize(instance.num_MPC_parties);
-    c_shares[repetition].resize(instance.num_MPC_parties);
-    alpha_shares[repetition].resize(instance.num_MPC_parties);
-    beta_shares[repetition].resize(instance.num_MPC_parties);
     v_shares[repetition].resize(instance.num_MPC_parties);
-    for (size_t k = 0; k < L; k++) {
-      lagrange_polys_evaluated_at_Re_L[k] = field::eval(
-          precomputation_for_zero_to_L[k], R_eps_e[repetition].first);
-    }
-    for (size_t k = 0; k < 2 * L - 1; k++) {
-      lagrange_polys_evaluated_at_Re_2L[k] = field::eval(
-          precomputation_for_zero_to_2L_min_1[k], R_eps_e[repetition].first);
-    }
 
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      // compute a_e^i
-      a_shares[repetition][party] = dot_product(
-          lagrange_polys_evaluated_at_Re_L, S_e_shares[repetition][party]);
-      // compute b_e^i
-      b_shares[repetition][party] = dot_product(
-          lagrange_polys_evaluated_at_Re_L, T_e_shares[repetition][party]);
-      // compute c_e^i
-      c_shares[repetition][party] = dot_product(
-          lagrange_polys_evaluated_at_Re_2L, P_e_shares[repetition][party]);
-    }
-
-    auto triple = rep_shared_triple.get_repetition(repetition);
+    auto s_shares = rep_shared_s.get_repetition(repetition);
+    auto t_shares = rep_shared_t.get_repetition(repetition);
+    auto dot_a_shares = rep_shared_dot_a.get_repetition(repetition);
+    auto dot_c_share = rep_shared_dot_c.get_repetition(repetition);
+    auto alpha_shares = rep_alpha_shares.get_repetition(repetition);
 
 #ifndef NDEBUG
-    // sanity check: a*b=c
-    GF a(0), b(0), c(0);
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      a += a_shares[repetition][party];
-      b += b_shares[repetition][party];
-      c += c_shares[repetition][party];
+    // sanity check: a*t=c
+    GF acc(0), c(0);
+    std::vector<GF> a(L);
+    for (size_t ell = 0; ell < L; ell++) {
+      for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+        a[ell] += dot_a_shares[party][ell];
+      }
+      acc += a[ell] * sbox_pairs.second[ell];
     }
-    assert(a * b == c);
-    // sanity check: x*y=z
-    GF x(0), y(0), z(0);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      x += triple[party][0];
-      y += triple[party][1];
-      z += triple[party][2];
+      c += dot_c_share[party][0];
     }
-    assert(x * y == z);
+    assert(acc == c);
 #endif
 
     // execute sacrificing check protocol
-    // alpha^i = eps * a^i + x^i
-    // beta^i = b^i + y^i
-    GF alpha(0), beta(0);
+    // alpha_j^i = eps_j * s_j^i + a_j^i
+    std::vector<GF> alphas(L);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      alpha_shares[repetition][party] =
-          a_shares[repetition][party] * R_eps_e[repetition].second +
-          triple[party][0];
-      beta_shares[repetition][party] =
-          b_shares[repetition][party] + triple[party][1];
-      alpha += alpha_shares[repetition][party];
-      beta += beta_shares[repetition][party];
+      for (size_t ell = 0; ell < L; ell++) {
+        alpha_shares[party][ell] =
+            s_shares[party][ell] * epsilons[repetition][ell] +
+            dot_a_shares[party][ell];
+        alphas[ell] += alpha_shares[party][ell];
+      }
     }
-    // v^i = eps * c^i - z^i + alpha*y^i + beta*x^i - alpha*beta
+    // v^i = dot(eps, 1) - c^i + dot(alpha, t^i)
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      v_shares[repetition][party] =
-          R_eps_e[repetition].second * c_shares[repetition][party] -
-          triple[party][2] + alpha * triple[party][1] + beta * triple[party][0];
+      v_shares[repetition][party] -= dot_c_share[party][0];
+      for (size_t ell = 0; ell < L; ell++) {
+        v_shares[repetition][party] -= alphas[ell] * t_shares[party][ell];
+      }
     }
-    v_shares[repetition][0] -= alpha * beta;
+    for (size_t ell = 0; ell < L; ell++) {
+      v_shares[repetition][0] += epsilons[repetition][ell];
+    }
+
 #ifndef NDEBUG
-    assert(alpha == R_eps_e[repetition].second * a + x);
-    assert(beta == b + y);
+    for (size_t ell = 0; ell < L; ell++) {
+      assert(alphas[ell] ==
+             epsilons[repetition][ell] * sbox_pairs.first[ell] - a[ell]);
+    }
     // sanity check: vs are zero
     GF v(0);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
@@ -803,8 +641,8 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   // phase 4: challenge the views of the checking protocol
   /////////////////////////////////////////////////////////////////////////////
 
-  std::vector<uint8_t> h_2 = phase_2_commitment(
-      instance, salt, h_1, alpha_shares, beta_shares, v_shares);
+  std::vector<uint8_t> h_2 =
+      phase_2_commitment(instance, salt, h_1, rep_alpha_shares, v_shares);
 
   std::vector<uint16_t> missing_parties = phase_2_expand(instance, h_2);
 
@@ -827,15 +665,11 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
         party_seed_commitments.get(repetition, missing_party);
     std::copy(std::begin(missing_commitment), std::end(missing_commitment),
               std::begin(commitment));
+    auto alpha_values = rep_alpha_shares.get(repetition, missing_party);
+    std::vector<GF> missing_alphas(alpha_values.begin(), alpha_values.end());
     repetition_proof_t<GF> proof{
-        seeds[repetition],
-        commitment,
-        rep_key_deltas[repetition],
-        rep_t_deltas[repetition],
-        P_deltas[repetition],
-        rep_z_deltas[repetition],
-        alpha_shares[repetition][missing_party],
-        beta_shares[repetition][missing_party],
+        seeds[repetition],        commitment,     rep_key_deltas[repetition],
+        rep_t_deltas[repetition], missing_alphas, rep_c_deltas[repetition],
     };
     proofs.push_back(proof);
   }
@@ -862,13 +696,10 @@ bool rainier_verify_template(const signature_instance_t &instance,
   // do parallel repetitions
   // create seed trees and random tapes
   std::vector<SeedTree> seed_trees;
-  // key share + L*T_share + x_share + y_share + z_share + (L-1) *
-  // P_share
-  const size_t random_tape_size =
-      instance.block_cipher_params.key_size +
-      L * instance.block_cipher_params.block_size +
-      3 * instance.block_cipher_params.block_size +
-      (L - 1) * instance.block_cipher_params.block_size;
+  // key share + L*T_share + L * a_share + z_share
+  const size_t random_tape_size = instance.block_cipher_params.key_size +
+                                  L * GF::BYTE_SIZE + L * GF::BYTE_SIZE +
+                                  GF::BYTE_SIZE;
 
   RandomTapes random_tapes(instance.num_repetitions, instance.num_MPC_parties,
                            random_tape_size);
@@ -876,10 +707,8 @@ bool rainier_verify_template(const signature_instance_t &instance,
       instance.num_repetitions, instance.num_MPC_parties, instance.digest_size);
 
   // h1 expansion
-  std::vector<GF> forbidden_challenge_values =
-      field::get_first_n_field_elements<GF>(L);
-  std::vector<std::pair<GF, GF>> R_eps_e =
-      phase_1_expand(instance, signature.h_1, forbidden_challenge_values);
+  std::vector<std::vector<GF>> epsilons =
+      phase_1_expand<GF>(instance, signature.h_1);
   // h2 expansion already happened in deserialize to get missing parties
   std::vector<uint16_t> missing_parties =
       phase_2_expand(instance, signature.h_2);
@@ -955,11 +784,14 @@ bool rainier_verify_template(const signature_instance_t &instance,
   RepContainer<GF> rep_shared_t(instance.num_repetitions,
                                 instance.num_MPC_parties,
                                 instance.block_cipher_params.num_sboxes);
-  RepContainer<GF> rep_shared_triple(instance.num_repetitions,
-                                     instance.num_MPC_parties, 3);
   RepByteContainer rep_output_broadcasts(
       instance.num_repetitions, instance.num_MPC_parties,
       instance.block_cipher_params.block_size);
+
+  RepContainer<GF> rep_shared_dot_a(instance.num_repetitions,
+                                    instance.num_MPC_parties, L);
+  RepContainer<GF> rep_shared_dot_c(instance.num_repetitions,
+                                    instance.num_MPC_parties, 1);
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
@@ -997,7 +829,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
                    std::begin(first_shared_t), std::begin(first_shared_t),
                    std::minus<GF>());
 
-    // get shares of sbox inputs by executing MPC AES
+    // get shares of sbox inputs by executing MPC RAIN
     auto ct_shares = rep_output_broadcasts.get_repetition(repetition);
     auto shared_s = rep_shared_s.get_repetition(repetition);
 
@@ -1057,182 +889,86 @@ bool rainier_verify_template(const signature_instance_t &instance,
   }
 
   /////////////////////////////////////////////////////////////////////////////
-  // recompute shares of polynomials
+  // recompute shares of dot product
   /////////////////////////////////////////////////////////////////////////////
-  // a vector of the first m2+1 field elements for interpolation
-  std::vector<GF> x_values_for_interpolation_zero_to_L =
-      field::get_first_n_field_elements<GF>(L);
-  std::vector<std::vector<GF>> precomputation_for_zero_to_L =
-      field::precompute_lagrange_polynomials(
-          x_values_for_interpolation_zero_to_L);
-  std::vector<GF> x_values_for_interpolation_zero_to_2L_min_1 =
-      field::get_first_n_field_elements<GF>(2 * L - 1);
-  std::vector<std::vector<GF>> precomputation_for_zero_to_2L_min_1 =
-      field::precompute_lagrange_polynomials(
-          x_values_for_interpolation_zero_to_2L_min_1);
-
-  std::vector<std::vector<GF>> P_e(instance.num_repetitions);
-  std::vector<std::vector<std::vector<GF>>> P_e_shares(
-      instance.num_repetitions);
-  std::vector<std::vector<std::vector<GF>>> S_e_shares(
-      instance.num_repetitions);
-  std::vector<std::vector<std::vector<GF>>> T_e_shares(
-      instance.num_repetitions);
 
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
     const repetition_proof_t<GF> &proof = signature.proofs[repetition];
-    S_e_shares[repetition].resize(instance.num_MPC_parties);
-    T_e_shares[repetition].resize(instance.num_MPC_parties);
 
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      if (party != missing_parties[repetition]) {
-        S_e_shares[repetition][party].resize(L);
-        T_e_shares[repetition][party].resize(L);
-        auto shared_s = rep_shared_s.get(repetition, party);
-        auto shared_t = rep_shared_t.get(repetition, party);
-        for (size_t idx = 0; idx < L; idx++) {
-          S_e_shares[repetition][party][idx] = shared_s[idx];
-          T_e_shares[repetition][party][idx] = shared_t[idx];
-        }
-      }
-    }
-
-    // compute sharing of P
-    std::vector<std::vector<GF>> &P_shares = P_e_shares[repetition];
-    P_shares.resize(instance.num_MPC_parties);
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      if (party != missing_parties[repetition]) {
-        // first m2 points: first party = 1, other parties = 0
-        P_shares[party].resize(2 * L - 1);
-        if (party == 0) {
-          for (size_t k = 0; k < L; k++) {
-            P_shares[party][k] = GF(1);
-          }
-        } else {
-          for (size_t k = 0; k < L; k++) {
-            P_shares[party][k] = GF(0);
-          }
-        }
-
-        // second L-1 points: sample from random tape
-        auto random_P_shares = random_tapes.get_bytes(
-            repetition, party,
-            instance.block_cipher_params.key_size +
-                L * instance.block_cipher_params.block_size,
-            (L - 1) * instance.block_cipher_params.block_size);
-        for (size_t k = L; k < 2 * L - 1; k++) {
-          P_shares[party][k].from_bytes(
-              random_P_shares.data() +
-              (k - L) * instance.block_cipher_params.block_size);
-        }
-      }
-    }
-    if (0 != missing_parties[repetition]) {
-      for (size_t k = L; k < 2 * L - 1; k++) {
-        // adjust first share with delta from signature
-        P_shares[0][k] += proof.P_delta[k - L];
-      }
-    }
-    // also generate valid triple x,y,z and save z_delta
+    // also generate valid dot triple a,t,c and save c_delta
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_parties[repetition]) {
         auto random_triple_bytes = random_tapes.get_bytes(
             repetition, party,
-            instance.block_cipher_params.key_size +
-                L * instance.block_cipher_params.block_size +
-                (L - 1) * instance.block_cipher_params.block_size,
-            3 * instance.block_cipher_params.block_size);
-        auto triple_share = rep_shared_triple.get(repetition, party);
-        triple_share[0].from_bytes(random_triple_bytes.data());
-        triple_share[1].from_bytes(random_triple_bytes.data() +
-                                   instance.block_cipher_params.block_size);
-        triple_share[2].from_bytes(random_triple_bytes.data() +
-                                   2 * instance.block_cipher_params.block_size);
+            instance.block_cipher_params.key_size + L * GF::BYTE_SIZE,
+            (L + 1) * GF::BYTE_SIZE);
+        auto a_share = rep_shared_dot_a.get(repetition, party);
+        for (size_t ell = 0; ell < L; ell++) {
+          a_share[ell].from_bytes(random_triple_bytes.data() +
+                                  GF::BYTE_SIZE * ell);
+        }
+        auto c_share = rep_shared_dot_c.get(repetition, party);
+        c_share[0].from_bytes(random_triple_bytes.data() + GF::BYTE_SIZE * L);
       }
     }
+
     // fix party 0's share
     if (0 != missing_parties[repetition]) {
       // adjust first share with delta from signature
-      rep_shared_triple.get(repetition, 0)[2] += proof.z_delta;
+      rep_shared_dot_c.get(repetition, 0)[0] += proof.c_delta;
     }
   }
 
   /////////////////////////////////////////////////////////////////////////////
-  // recompute views of polynomial checks
+  // recompute views of sacrificing checks
   /////////////////////////////////////////////////////////////////////////////
-  std::vector<std::vector<GF>> a_shares(instance.num_repetitions);
-  std::vector<std::vector<GF>> b_shares(instance.num_repetitions);
-  std::vector<std::vector<GF>> c_shares(instance.num_repetitions);
-
-  std::vector<std::vector<GF>> alpha_shares(instance.num_repetitions);
-  std::vector<std::vector<GF>> beta_shares(instance.num_repetitions);
+  RepContainer<GF> rep_alpha_shares(instance.num_repetitions,
+                                    instance.num_MPC_parties, L);
   std::vector<std::vector<GF>> v_shares(instance.num_repetitions);
 
-  std::vector<GF> lagrange_polys_evaluated_at_Re_L(L);
-  std::vector<GF> lagrange_polys_evaluated_at_Re_2L(2 * L - 1);
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
     const repetition_proof_t<GF> &proof = signature.proofs[repetition];
     size_t missing_party = missing_parties[repetition];
 
-    for (size_t k = 0; k < L; k++) {
-      lagrange_polys_evaluated_at_Re_L[k] = field::eval(
-          precomputation_for_zero_to_L[k], R_eps_e[repetition].first);
-    }
-    for (size_t k = 0; k < 2 * L - 1; k++) {
-      lagrange_polys_evaluated_at_Re_2L[k] = field::eval(
-          precomputation_for_zero_to_2L_min_1[k], R_eps_e[repetition].first);
-    }
-
-    a_shares[repetition].resize(instance.num_MPC_parties);
-    b_shares[repetition].resize(instance.num_MPC_parties);
-    c_shares[repetition].resize(instance.num_MPC_parties);
-    alpha_shares[repetition].resize(instance.num_MPC_parties);
-    beta_shares[repetition].resize(instance.num_MPC_parties);
     v_shares[repetition].resize(instance.num_MPC_parties);
+    std::vector<GF> alphas(L);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
+      auto alpha_shares = rep_alpha_shares.get(repetition, party);
+      auto a_shares = rep_shared_dot_a.get(repetition, party);
+      auto s_shares = rep_shared_s.get(repetition, party);
       if (party != missing_party) {
-        // compute a_ej^i and b_ej^i
-        a_shares[repetition][party] = dot_product(
-            lagrange_polys_evaluated_at_Re_L, S_e_shares[repetition][party]);
-        b_shares[repetition][party] = dot_product(
-            lagrange_polys_evaluated_at_Re_L, T_e_shares[repetition][party]);
-        // compute c_e^i
-        c_shares[repetition][party] = dot_product(
-            lagrange_polys_evaluated_at_Re_2L, P_e_shares[repetition][party]);
-      }
-    }
-    auto triple = rep_shared_triple.get_repetition(repetition);
-    GF alpha(0), beta(0);
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      if (party != missing_party) {
-        alpha_shares[repetition][party] =
-            a_shares[repetition][party] * R_eps_e[repetition].second -
-            triple[party][0];
-        beta_shares[repetition][party] =
-            b_shares[repetition][party] - triple[party][1];
-        alpha += alpha_shares[repetition][party];
-        beta += beta_shares[repetition][party];
+        for (size_t ell = 0; ell < L; ell++) {
+          alpha_shares[ell] =
+              s_shares[ell] * epsilons[repetition][ell] - a_shares[ell];
+          alphas[ell] += alpha_shares[ell];
+        }
       }
     }
     // fill missing shares
-    alpha_shares[repetition][missing_party] = proof.missing_alpha_share;
-    beta_shares[repetition][missing_party] = proof.missing_beta_share;
-    alpha += proof.missing_alpha_share;
-    beta += proof.missing_beta_share;
+    auto missing_alphas = rep_alpha_shares.get(repetition, missing_party);
+    for (size_t ell = 0; ell < L; ell++) {
+      missing_alphas[ell] = proof.missing_alpha_shares[ell];
+      alphas[ell] += proof.missing_alpha_shares[ell];
+    }
     // v^i = eps * c^i + z^i - alpha*y^i - beta*x^i - alpha*beta
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_party) {
-        v_shares[repetition][party] =
-            R_eps_e[repetition].second * c_shares[repetition][party] +
-            triple[party][2] - alpha * triple[party][1] -
-            beta * triple[party][0];
+        auto t_shares = rep_shared_t.get(repetition, party);
+        auto c_share = rep_shared_dot_c.get(repetition, party);
+        v_shares[repetition][party] -= c_share[0];
+        for (size_t ell = 0; ell < L; ell++) {
+          v_shares[repetition][party] -= alphas[ell] * t_shares[ell];
+        }
+      }
+    }
+    if (missing_party != 0) {
+      for (size_t ell = 0; ell < L; ell++) {
+        v_shares[repetition][0] += epsilons[repetition][ell];
       }
     }
     // calculate missing shares as 0 - sum_{i!=missing} v^i
-    if (missing_party != 0)
-      v_shares[repetition][0] -= alpha * beta;
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       if (party != missing_party) {
         v_shares[repetition][missing_party] -= v_shares[repetition][party];
@@ -1244,25 +980,22 @@ bool rainier_verify_template(const signature_instance_t &instance,
   /////////////////////////////////////////////////////////////////////////////
   std::vector<std::vector<uint8_t>> sk_deltas;
   std::vector<std::vector<GF>> t_deltas;
-  std::vector<std::vector<GF>> P_deltas;
-  std::vector<GF> z_deltas;
+  std::vector<GF> c_deltas;
   sk_deltas.reserve(instance.num_repetitions);
   t_deltas.reserve(instance.num_repetitions);
-  P_deltas.reserve(instance.num_repetitions);
-  z_deltas.reserve(instance.num_repetitions);
+  c_deltas.reserve(instance.num_repetitions);
   for (const repetition_proof_t<GF> &proof : signature.proofs) {
     sk_deltas.push_back(proof.sk_delta);
     t_deltas.push_back(proof.t_delta);
-    P_deltas.push_back(proof.P_delta);
-    z_deltas.push_back(proof.z_delta);
+    c_deltas.push_back(proof.c_delta);
   }
   std::vector<uint8_t> h_1 =
       phase_1_commitment(instance, signature.salt, pk, message, message_len,
                          party_seed_commitments, rep_output_broadcasts,
-                         sk_deltas, t_deltas, z_deltas, P_deltas);
+                         sk_deltas, t_deltas, c_deltas);
 
-  std::vector<uint8_t> h_2 = phase_2_commitment(
-      instance, signature.salt, h_1, alpha_shares, beta_shares, v_shares);
+  std::vector<uint8_t> h_2 = phase_2_commitment(instance, signature.salt, h_1,
+                                                rep_alpha_shares, v_shares);
   // do checks
   if (memcmp(h_1.data(), signature.h_1.data(), h_1.size()) != 0) {
     return false;
@@ -1288,12 +1021,9 @@ rainier_serialize_signature(const signature_instance_t &instance,
                instance.seed_size +                // merkle tree path
            instance.digest_size +                  // Com_e
            instance.block_cipher_params.key_size + // delta sk
-           instance.block_cipher_params.block_size *
-               instance.block_cipher_params.num_sboxes + // delta t
-           (instance.block_cipher_params.num_sboxes - 1) *
-               instance.block_cipher_params.block_size + // delta P
-           instance.block_cipher_params.block_size +     // delta z
-           instance.block_cipher_params.block_size * 2); // alpha, beta
+           instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE + // delta t
+           instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE + // alpha
+           GF::BYTE_SIZE);                                           // delta_c
   serialized.reserve(signature_size);
 
   serialized.insert(serialized.end(), signature.salt.begin(),
@@ -1321,21 +1051,16 @@ rainier_serialize_signature(const signature_instance_t &instance,
     }
     current_size = serialized.size();
     serialized.resize(current_size +
-                      (instance.block_cipher_params.num_sboxes - 1) *
-                          GF::BYTE_SIZE);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
-      proof.P_delta[k].to_bytes(serialized.data() + current_size +
-                                k * GF::BYTE_SIZE);
+                      instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE);
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes; k++) {
+      proof.missing_alpha_shares[k].to_bytes(serialized.data() + current_size +
+                                             k * GF::BYTE_SIZE);
     }
     current_size = serialized.size();
-    serialized.resize(current_size + GF::BYTE_SIZE);
-    proof.z_delta.to_bytes(serialized.data() + current_size);
-    current_size = serialized.size();
 
-    serialized.resize(current_size + 2 * GF::BYTE_SIZE);
-    proof.missing_alpha_share.to_bytes(serialized.data() + current_size);
-    proof.missing_beta_share.to_bytes(serialized.data() + current_size +
-                                      GF::BYTE_SIZE);
+    serialized.resize(current_size + GF::BYTE_SIZE);
+    proof.c_delta.to_bytes(serialized.data() + current_size);
+    current_size = serialized.size();
   }
   // calculation as expected
   assert(signature_size == serialized.size());
@@ -1390,26 +1115,25 @@ rainier_deserialize_signature(const signature_instance_t &instance,
       t_delta.push_back(tmp);
     }
 
-    std::vector<GF> P_delta;
-    P_delta.reserve(instance.block_cipher_params.num_sboxes - 1);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
+    std::vector<GF> missing_alpha_shares;
+    missing_alpha_shares.reserve(instance.block_cipher_params.num_sboxes);
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes; k++) {
       tmp.from_bytes(serialized.data() + current_offset);
       current_offset += GF::BYTE_SIZE;
-      P_delta.push_back(tmp);
+      missing_alpha_shares.push_back(tmp);
     }
-    GF z_delta;
-    z_delta.from_bytes(serialized.data() + current_offset);
-    current_offset += GF::BYTE_SIZE;
-    GF missing_alpha_share;
-    missing_alpha_share.from_bytes(serialized.data() + current_offset);
-    current_offset += GF::BYTE_SIZE;
-    GF missing_beta_share;
-    missing_beta_share.from_bytes(serialized.data() + current_offset);
+    GF c_delta;
+    c_delta.from_bytes(serialized.data() + current_offset);
     current_offset += GF::BYTE_SIZE;
 
     proofs.emplace_back(repetition_proof_t<GF>{
-        reveallist, Com_e, sk_delta, t_delta, P_delta, z_delta,
-        missing_alpha_share, missing_beta_share});
+        reveallist,
+        Com_e,
+        sk_delta,
+        t_delta,
+        missing_alpha_shares,
+        c_delta,
+    });
   }
   assert(current_offset == serialized.size());
   signature_t<GF> signature{salt, h_1, h_2, proofs};
