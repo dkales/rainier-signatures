@@ -30,14 +30,15 @@ template <typename GF> struct repetition_proof_t {
   std::vector<uint8_t> Com_e;
   std::vector<uint8_t> sk_delta;
   std::vector<GF> t_delta;
-  std::vector<GF> missing_alpha_shares;
   GF c_delta;
+  GF d_delta;
 };
 
 template <typename GF> struct signature_t {
   salt_t salt;
   std::vector<uint8_t> h_1;
   std::vector<uint8_t> h_2;
+  std::vector<GF> alphas;
   std::vector<repetition_proof_t<GF>> proofs;
 };
 
