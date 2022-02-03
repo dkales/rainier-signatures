@@ -575,9 +575,9 @@ rain_with_sbox_output(const std::vector<uint8_t> &key_in,
                       std::vector<uint8_t> &ciphertext_out);
 
 void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
-              const std::vector<gsl::span<field::GF2_128>> &t_shares,
+              std::vector<gsl::span<field::GF2_128>> &t_shares,
               const std::vector<uint8_t> &plaintext_in,
-              std::vector<gsl::span<uint8_t>> &ciphertext_shares_out,
+              const std::vector<uint8_t> &ciphertext_in,
               std::vector<gsl::span<field::GF2_128>> &s_shares_out);
 
 } // namespace RAIN_128_3

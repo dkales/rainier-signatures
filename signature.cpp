@@ -90,7 +90,6 @@ std::vector<uint8_t>
 phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
                    const std::vector<uint8_t> &pk, const uint8_t *message,
                    size_t message_len, const RepByteContainer &commitments,
-                   const RepByteContainer &output_broadcasts,
                    const std::vector<std::vector<uint8_t>> &key_deltas,
                    const std::vector<std::vector<GF>> &t_deltas,
                    const std::vector<GF> &c_deltas) {
@@ -106,12 +105,11 @@ phase_1_commitment(const signature_instance_t &instance, const salt_t &salt,
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       auto commitment = commitments.get(repetition, party);
       hash_update(&ctx, commitment.data(), commitment.size());
-      auto output_broadcast = output_broadcasts.get(repetition, party);
-      hash_update(&ctx, output_broadcast.data(), output_broadcast.size());
     }
     hash_update(&ctx, key_deltas[repetition].data(),
                 key_deltas[repetition].size());
-    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
+    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes - 1;
+         ell++) {
       hash_update_GF2E(&ctx, instance, t_deltas[repetition][ell]);
     }
     hash_update_GF2E(&ctx, instance, c_deltas[repetition]);
@@ -386,9 +384,6 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   RepByteContainer rep_shared_keys(instance.num_repetitions,
                                    instance.num_MPC_parties,
                                    instance.block_cipher_params.key_size);
-  RepByteContainer rep_output_broadcasts(
-      instance.num_repetitions, instance.num_MPC_parties,
-      instance.block_cipher_params.block_size);
   RepContainer<GF> rep_shared_s(instance.num_repetitions,
                                 instance.num_MPC_parties, L);
   RepContainer<GF> rep_shared_t(instance.num_repetitions,
@@ -430,66 +425,63 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     rep_key_deltas.push_back(key_delta);
     // generate sharing of t values
     std::vector<GF> t_deltas = sbox_pairs.second;
+    // we no longer need the last t_delta
+    t_deltas.pop_back();
+
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       auto shared_t = rep_shared_t.get(repetition, party);
       auto random_t_shares = random_tapes.get_bytes(
           repetition, party, instance.block_cipher_params.key_size,
           L * instance.block_cipher_params.block_size);
-      for (size_t ell = 0; ell < L; ell++) {
+      for (size_t ell = 0; ell < L - 1; ell++) {
         shared_t[ell].from_bytes(random_t_shares.data() +
                                  ell * instance.block_cipher_params.block_size);
       }
-      std::transform(std::begin(shared_t), std::end(shared_t),
-                     std::begin(t_deltas), std::begin(t_deltas),
-                     std::plus<GF>());
+      for (size_t ell = 0; ell < L - 1; ell++) {
+        t_deltas[ell] += shared_t[ell];
+      }
     }
     // fix first share
-    auto first_share_t = rep_shared_t.get(repetition, 0);
-    std::transform(std::begin(t_deltas), std::end(t_deltas),
-                   std::begin(first_share_t), std::begin(first_share_t),
-                   std::minus<GF>());
+    auto first_shared_t = rep_shared_t.get(repetition, 0);
+    for (size_t ell = 0; ell < L - 1; ell++) {
+      first_shared_t[ell] -= t_deltas[ell];
+    }
 
     // get shares of sbox inputs by simulating MPC execution
-    auto ct_shares = rep_output_broadcasts.get_repetition(repetition);
     auto shared_s = rep_shared_s.get_repetition(repetition);
+    auto shared_t = rep_shared_t.get_repetition(repetition);
 
     if constexpr (std::is_same<GF, field::GF2_128>::value) {
       if (instance.block_cipher_params.key_size == 16 &&
           instance.block_cipher_params.num_sboxes == 3)
         RAIN_128_3::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else if (instance.block_cipher_params.key_size == 16 &&
                instance.block_cipher_params.num_sboxes == 4)
         RAIN_128_4::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else
         throw std::runtime_error("invalid parameters");
     } else if constexpr (std::is_same<GF, field::GF2_192>::value) {
       if (instance.block_cipher_params.key_size == 24 &&
           instance.block_cipher_params.num_sboxes == 3)
         RAIN_192_3::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else if (instance.block_cipher_params.key_size == 24 &&
                instance.block_cipher_params.num_sboxes == 4)
         RAIN_192_4::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else
         throw std::runtime_error("invalid parameters");
     } else if constexpr (std::is_same<GF, field::GF2_256>::value) {
       if (instance.block_cipher_params.key_size == 32 &&
           instance.block_cipher_params.num_sboxes == 3)
         RAIN_256_3::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else if (instance.block_cipher_params.key_size == 32 &&
                instance.block_cipher_params.num_sboxes == 4)
         RAIN_256_4::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else
         throw std::runtime_error("invalid parameters");
     } else {
@@ -497,16 +489,6 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     }
 
 #ifndef NDEBUG
-    // sanity check, mpc execution = plain one
-    std::vector<uint8_t> ct_check(instance.block_cipher_params.block_size);
-    memset(ct_check.data(), 0, ct_check.size());
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      std::transform(std::begin(ct_shares[party]), std::end(ct_shares[party]),
-                     std::begin(ct_check), std::begin(ct_check),
-                     std::bit_xor<uint8_t>());
-    }
-
-    assert(ct == ct_check);
     // sanity check, all s and t values multiply to 1
     for (size_t ell = 0; ell < L; ell++) {
       GF test_S, test_T;
@@ -559,10 +541,9 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   // commit to salt, (all commitments of parties seeds,
   // output_broadcasts, key_delta, t_delta, P_delta) for all
   // repetitions
-  std::vector<uint8_t> h_1 =
-      phase_1_commitment(instance, salt, keypair.second, message, message_len,
-                         party_seed_commitments, rep_output_broadcasts,
-                         rep_key_deltas, rep_t_deltas, rep_c_deltas);
+  std::vector<uint8_t> h_1 = phase_1_commitment(
+      instance, salt, keypair.second, message, message_len,
+      party_seed_commitments, rep_key_deltas, rep_t_deltas, rep_c_deltas);
 
   // expand challenge hash to epsilon values
   std::vector<std::vector<GF>> epsilons = phase_1_expand<GF>(instance, h_1);
@@ -784,9 +765,6 @@ bool rainier_verify_template(const signature_instance_t &instance,
   RepContainer<GF> rep_shared_t(instance.num_repetitions,
                                 instance.num_MPC_parties,
                                 instance.block_cipher_params.num_sboxes);
-  RepByteContainer rep_output_broadcasts(
-      instance.num_repetitions, instance.num_MPC_parties,
-      instance.block_cipher_params.block_size);
 
   RepContainer<GF> rep_shared_dot_a(instance.num_repetitions,
                                     instance.num_MPC_parties, L);
@@ -818,73 +796,56 @@ bool rainier_verify_template(const signature_instance_t &instance,
       auto random_t_shares = random_tapes.get_bytes(
           repetition, party, instance.block_cipher_params.key_size,
           L * instance.block_cipher_params.block_size);
-      for (size_t ell = 0; ell < L; ell++) {
+      for (size_t ell = 0; ell < L - 1; ell++) {
         shared_t[ell].from_bytes(random_t_shares.data() +
                                  ell * instance.block_cipher_params.block_size);
       }
     }
     // fix first share
     auto first_shared_t = rep_shared_t.get(repetition, 0);
-    std::transform(std::begin(proof.t_delta), std::end(proof.t_delta),
-                   std::begin(first_shared_t), std::begin(first_shared_t),
-                   std::minus<GF>());
+    for (size_t ell = 0; ell < L - 1; ell++) {
+      first_shared_t[ell] -= proof.t_delta[ell];
+    }
 
     // get shares of sbox inputs by executing MPC RAIN
-    auto ct_shares = rep_output_broadcasts.get_repetition(repetition);
     auto shared_s = rep_shared_s.get_repetition(repetition);
+    auto shared_t = rep_shared_t.get_repetition(repetition);
 
     if constexpr (std::is_same<GF, field::GF2_128>::value) {
       if (instance.block_cipher_params.key_size == 16 &&
           instance.block_cipher_params.num_sboxes == 3)
         RAIN_128_3::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else if (instance.block_cipher_params.key_size == 16 &&
                instance.block_cipher_params.num_sboxes == 4)
         RAIN_128_4::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else
         throw std::runtime_error("invalid parameters");
     } else if constexpr (std::is_same<GF, field::GF2_192>::value) {
       if (instance.block_cipher_params.key_size == 24 &&
           instance.block_cipher_params.num_sboxes == 3)
         RAIN_192_3::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else if (instance.block_cipher_params.key_size == 24 &&
                instance.block_cipher_params.num_sboxes == 4)
         RAIN_192_4::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else
         throw std::runtime_error("invalid parameters");
     } else if constexpr (std::is_same<GF, field::GF2_256>::value) {
       if (instance.block_cipher_params.key_size == 32 &&
           instance.block_cipher_params.num_sboxes == 3)
         RAIN_256_3::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else if (instance.block_cipher_params.key_size == 32 &&
                instance.block_cipher_params.num_sboxes == 4)
         RAIN_256_4::rain_mpc(rep_shared_keys.get_repetition(repetition),
-                             rep_shared_t.get_repetition(repetition), pt,
-                             ct_shares, shared_s);
+                             shared_t, pt, ct, shared_s);
       else
         throw std::runtime_error("invalid parameters");
     } else {
       throw std::runtime_error("no implementation for type");
-    }
-
-    // calculate missing output broadcast
-    std::copy(ct.begin(), ct.end(),
-              ct_shares[missing_parties[repetition]].begin());
-    for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      if (party != missing_parties[repetition])
-        std::transform(std::begin(ct_shares[party]), std::end(ct_shares[party]),
-                       std::begin(ct_shares[missing_parties[repetition]]),
-                       std::begin(ct_shares[missing_parties[repetition]]),
-                       std::bit_xor<uint8_t>());
     }
   }
 
@@ -991,8 +952,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
   }
   std::vector<uint8_t> h_1 =
       phase_1_commitment(instance, signature.salt, pk, message, message_len,
-                         party_seed_commitments, rep_output_broadcasts,
-                         sk_deltas, t_deltas, c_deltas);
+                         party_seed_commitments, sk_deltas, t_deltas, c_deltas);
 
   std::vector<uint8_t> h_2 = phase_2_commitment(instance, signature.salt, h_1,
                                                 rep_alpha_shares, v_shares);
@@ -1021,7 +981,8 @@ rainier_serialize_signature(const signature_instance_t &instance,
                instance.seed_size +                // merkle tree path
            instance.digest_size +                  // Com_e
            instance.block_cipher_params.key_size + // delta sk
-           instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE + // delta t
+           (instance.block_cipher_params.num_sboxes - 1) *
+               GF::BYTE_SIZE +                                       // delta t
            instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE + // alpha
            GF::BYTE_SIZE);                                           // delta_c
   serialized.reserve(signature_size);
@@ -1044,8 +1005,10 @@ rainier_serialize_signature(const signature_instance_t &instance,
                       proof.sk_delta.end());
     size_t current_size = serialized.size();
     serialized.resize(current_size +
-                      instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE);
-    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
+                      (instance.block_cipher_params.num_sboxes - 1) *
+                          GF::BYTE_SIZE);
+    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes - 1;
+         ell++) {
       proof.t_delta[ell].to_bytes(serialized.data() + current_size +
                                   ell * GF::BYTE_SIZE);
     }
@@ -1073,7 +1036,7 @@ rainier_deserialize_signature(const signature_instance_t &instance,
                               const std::vector<uint8_t> &serialized) {
 
   size_t current_offset = 0;
-  salt_t salt;
+  salt_t salt{};
   memcpy(salt.data(), serialized.data() + current_offset, salt.size());
   current_offset += salt.size();
   std::vector<uint8_t> h_1(instance.digest_size), h_2(instance.digest_size);
@@ -1108,8 +1071,9 @@ rainier_deserialize_signature(const signature_instance_t &instance,
 
     GF tmp;
     std::vector<GF> t_delta;
-    t_delta.reserve(instance.block_cipher_params.num_sboxes);
-    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes; ell++) {
+    t_delta.reserve(instance.block_cipher_params.num_sboxes - 1);
+    for (size_t ell = 0; ell < instance.block_cipher_params.num_sboxes - 1;
+         ell++) {
       tmp.from_bytes(serialized.data() + current_offset);
       current_offset += GF::BYTE_SIZE;
       t_delta.push_back(tmp);

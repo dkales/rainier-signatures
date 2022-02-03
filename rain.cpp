@@ -91,9 +91,9 @@ rain_with_sbox_output(const std::vector<uint8_t> &key_in,
 
 template <typename Params, typename GF>
 void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
-              const std::vector<gsl::span<GF>> &t_shares,
+              std::vector<gsl::span<GF>> &t_shares,
               const std::vector<uint8_t> &plaintext_in,
-              std::vector<gsl::span<uint8_t>> &ciphertext_out,
+              const std::vector<uint8_t> &ciphertext_in,
               std::vector<gsl::span<GF>> &s_shares) {
   const size_t num_parties = key_in.size();
 
@@ -129,9 +129,13 @@ void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
       state += Params::roundconst[Params::NUM_SBOXES - 1];
     }
     s_shares[party][sbox_index] = state;
-    state = t_shares[party][sbox_index++];
+    // Opt C.4: calculate the last t_share instead of injecting it
+    if (party == 0)
+      state.from_bytes(ciphertext_in.data());
+    else
+      state = GF(0);
     state += key;
-    state.to_bytes(ciphertext_out[party].data());
+    t_shares[party][sbox_index++] = state;
   }
 }
 
@@ -155,12 +159,12 @@ void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
   }                                                                            \
                                                                                \
   void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,                 \
-                const std::vector<gsl::span<FIELD>> &t_shares,                 \
+                std::vector<gsl::span<FIELD>> &t_shares,                       \
                 const std::vector<uint8_t> &plaintext_in,                      \
-                std::vector<gsl::span<uint8_t>> &ciphertext_out,               \
+                const std::vector<uint8_t> &ciphertext_in,                     \
                 std::vector<gsl::span<FIELD>> &s_shares) {                     \
     ::rain_mpc<PARAMS::Params, FIELD>(key_in, t_shares, plaintext_in,          \
-                                      ciphertext_out, s_shares);               \
+                                      ciphertext_in, s_shares);                \
   }                                                                            \
   }
 

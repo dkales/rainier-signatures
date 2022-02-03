@@ -82,7 +82,7 @@ min_parameters = [
 
 ]
 
-SCALING_FACTOR = 1000 * 3600
+SCALING_FACTOR = 1000
 
 
 def parse_bench(filename):
