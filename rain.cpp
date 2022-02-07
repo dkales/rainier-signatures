@@ -147,13 +147,14 @@ void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
       state = state.multiply_with_transposed_GF2_matrix(
           Params::matrix_transposed[r]);
     }
-    // last round (not needed anymore because of opt C.5)
-    // state += key;
-    // if (party == 0) {
-    // state += Params::roundconst[Params::NUM_SBOXES - 1];
-    //}
-    // s_shares[party][sbox_index] = state;
-    //// Opt C.4: calculate the last t_share instead of injecting it
+    // last round
+    state += key;
+    if (party == 0) {
+      state += Params::roundconst[Params::NUM_SBOXES - 1];
+    }
+    s_shares[party][sbox_index] = state;
+    // Opt C.4: calculate the last t_share instead of injecting it
+    // superceded by opt c.5
     // if (party == 0)
     // state = ct;
     // else
@@ -169,16 +170,11 @@ void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
 
     c1 -= (pt + Params::roundconst[0]) * t_shares[party][0];
 
-    // k \cdot (t_3M_3 + k + c + c_4) = 1 - (t_3M_3)c - c_4c\,.
-    GF t(t_shares[party][Params::NUM_SBOXES - 2]);
-    t = t.multiply_with_transposed_GF2_matrix(
-        Params::matrix_transposed[Params::NUM_SBOXES - 2]);
-    a2 = t + key;
+    // k \cdot (s_4) = 1 - (s_4 * ct)
+    a2 = s_shares[party][Params::NUM_SBOXES - 1];
     if (party == 0)
-      a2 += ct + Params::roundconst[Params::NUM_SBOXES - 1];
-    if (party == 0)
-      c2 = GF(1) - Params::roundconst[Params::NUM_SBOXES - 1] * ct;
-    c2 -= t * ct;
+      c2 = GF(1);
+    c2 -= a2 * ct;
 
     s_shares[party][0] = a1;
     t_shares[party][0] = c1;
