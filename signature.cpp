@@ -258,6 +258,8 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
 
   // grab aes key, pt and ct
   std::vector<uint8_t> key = keypair.first;
+  GF key_gf;
+  key_gf.from_bytes(key.data());
   std::vector<uint8_t> pt_ct = keypair.second;
   const size_t total_pt_ct_size = instance.block_cipher_params.block_size;
   std::vector<uint8_t> pt(total_pt_ct_size), ct(total_pt_ct_size),
@@ -321,10 +323,10 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   // create seed trees and random tapes
   std::vector<SeedTree> seed_trees;
   seed_trees.reserve(instance.num_repetitions);
-  // key share + L*T_share + L * a_share + z_share
+  // key share + (L-1)*T_share + (L-1) * a_share + z_share
   const size_t random_tape_size = instance.block_cipher_params.key_size +
-                                  L * GF::BYTE_SIZE + L * GF::BYTE_SIZE +
-                                  GF::BYTE_SIZE;
+                                  (L - 1) * GF::BYTE_SIZE +
+                                  (L - 1) * GF::BYTE_SIZE + GF::BYTE_SIZE;
 
   RandomTapes random_tapes(instance.num_repetitions, instance.num_MPC_parties,
                            random_tape_size);
@@ -394,7 +396,7 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   rep_t_deltas.reserve(instance.num_repetitions);
 
   RepContainer<GF> rep_shared_dot_a(instance.num_repetitions,
-                                    instance.num_MPC_parties, L);
+                                    instance.num_MPC_parties, L - 1);
   RepContainer<GF> rep_shared_dot_c(instance.num_repetitions,
                                     instance.num_MPC_parties, 1);
   std::vector<GF> rep_c_deltas;
@@ -432,7 +434,7 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
       auto shared_t = rep_shared_t.get(repetition, party);
       auto random_t_shares = random_tapes.get_bytes(
           repetition, party, instance.block_cipher_params.key_size,
-          L * instance.block_cipher_params.block_size);
+          (L - 1) * instance.block_cipher_params.block_size);
       for (size_t ell = 0; ell < L - 1; ell++) {
         shared_t[ell].from_bytes(random_t_shares.data() +
                                  ell * instance.block_cipher_params.block_size);
@@ -489,14 +491,18 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     }
 
 #ifndef NDEBUG
-    // sanity check, all s and t values multiply to 1
+    // sanity check, all middle s and t values multiply to 1, and other ones are
+    // according to opt c.5
     for (size_t ell = 0; ell < L; ell++) {
       GF test_S, test_T;
       for (size_t party = 0; party < instance.num_MPC_parties; party++) {
         test_S += rep_shared_s.get_repetition(repetition)[party][ell];
         test_T += rep_shared_t.get_repetition(repetition)[party][ell];
       }
-      assert(test_S * test_T == GF(1));
+      if (ell == 0 || ell == L - 1)
+        assert(test_S * key_gf == test_T);
+      else
+        assert(test_S * test_T == GF(1));
     }
 #endif
     rep_t_deltas.push_back(t_deltas);
@@ -505,27 +511,31 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
   for (size_t repetition = 0; repetition < instance.num_repetitions;
        repetition++) {
 
-    // also generate valid dot triple a,t,c and save c_delta
-    std::vector<GF> a(L);
+    // also generate valid dot triple a,b,c and save c_delta
+    // note that due to opt c5, the first b is k, the remaining ones are t
+    std::vector<GF> a(L - 1);
     GF c(0);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       auto random_triple_bytes = random_tapes.get_bytes(
           repetition, party,
-          instance.block_cipher_params.key_size + L * GF::BYTE_SIZE,
-          (L + 1) * GF::BYTE_SIZE);
+          instance.block_cipher_params.key_size + (L - 1) * GF::BYTE_SIZE,
+          L * GF::BYTE_SIZE);
       auto a_share = rep_shared_dot_a.get(repetition, party);
-      for (size_t ell = 0; ell < L; ell++) {
+      for (size_t ell = 0; ell < L - 1; ell++) {
         a_share[ell].from_bytes(random_triple_bytes.data() +
                                 GF::BYTE_SIZE * ell);
         a[ell] += a_share[ell];
       }
       auto c_share = rep_shared_dot_c.get(repetition, party);
-      c_share[0].from_bytes(random_triple_bytes.data() + GF::BYTE_SIZE * L);
+      c_share[0].from_bytes(random_triple_bytes.data() +
+                            GF::BYTE_SIZE * (L - 1));
       c -= c_share[0];
     }
 
-    // calculate c_delta = -c + a*t, c is negated above already
-    for (size_t ell = 0; ell < L; ell++) {
+    // calculate c_delta = -c + a*b, c is negated above already
+    // note that due to opt c5, the first b is k, the remaining ones are t
+    c += a[0] * key_gf;
+    for (size_t ell = 1; ell < L - 1; ell++) {
       c += a[ell] * sbox_pairs.second[ell];
     }
     // calculate c_delta that fixes the dot triple
@@ -570,11 +580,14 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     // sanity check: a*t=c
     GF acc(0), c(0);
     std::vector<GF> a(L);
-    for (size_t ell = 0; ell < L; ell++) {
+    for (size_t ell = 0; ell < L - 1; ell++) {
       for (size_t party = 0; party < instance.num_MPC_parties; party++) {
         a[ell] += dot_a_shares[party][ell];
       }
-      acc += a[ell] * sbox_pairs.second[ell];
+      if (ell == 0)
+        acc += a[ell] * key_gf;
+      else
+        acc += a[ell] * sbox_pairs.second[ell];
     }
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       c += dot_c_share[party][0];
@@ -584,9 +597,17 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
 
     // execute sacrificing check protocol
     // alpha_j^i = eps_j * s_j^i + a_j^i
-    std::vector<GF> alphas(L);
+    std::vector<GF> alphas(L - 1);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
-      for (size_t ell = 0; ell < L; ell++) {
+      // first one is different due to opt c5
+      {
+        alpha_shares[party][0] =
+            s_shares[party][0] * epsilons[repetition][0] +
+            s_shares[party][L - 1] * epsilons[repetition][L - 1] +
+            dot_a_shares[party][0];
+        alphas[0] += alpha_shares[party][0];
+      }
+      for (size_t ell = 1; ell < L - 1; ell++) {
         alpha_shares[party][ell] =
             s_shares[party][ell] * epsilons[repetition][ell] +
             dot_a_shares[party][ell];
@@ -596,16 +617,24 @@ signature_t<GF> rainier_sign_template(const signature_instance_t &instance,
     // v^i = dot(eps, 1) - c^i + dot(alpha, t^i)
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       v_shares[repetition][party] -= dot_c_share[party][0];
-      for (size_t ell = 0; ell < L; ell++) {
+      for (size_t ell = 1; ell < L - 1; ell++) {
         v_shares[repetition][party] -= alphas[ell] * t_shares[party][ell];
       }
+      GF key_share;
+      key_share.from_bytes(rep_shared_keys.get(repetition, party).data());
+      v_shares[repetition][party] -= alphas[0] * key_share;
+      // add repeated multiplier shares here
+      v_shares[repetition][party] +=
+          epsilons[repetition][0] * t_shares[party][0] +
+          epsilons[repetition][L - 1] * t_shares[party][L - 1];
     }
-    for (size_t ell = 0; ell < L; ell++) {
+    // remaining ones where z = 1 are only for party 1
+    for (size_t ell = 1; ell < L - 1; ell++) {
       v_shares[repetition][0] += epsilons[repetition][ell];
     }
 
 #ifndef NDEBUG
-    for (size_t ell = 0; ell < L; ell++) {
+    for (size_t ell = 1; ell < L - 1; ell++) {
       assert(alphas[ell] ==
              epsilons[repetition][ell] * sbox_pairs.first[ell] - a[ell]);
     }
@@ -677,10 +706,10 @@ bool rainier_verify_template(const signature_instance_t &instance,
   // do parallel repetitions
   // create seed trees and random tapes
   std::vector<SeedTree> seed_trees;
-  // key share + L*T_share + L * a_share + z_share
+  // key share + (L-1)*T_share + (L-1) * a_share + c_share
   const size_t random_tape_size = instance.block_cipher_params.key_size +
-                                  L * GF::BYTE_SIZE + L * GF::BYTE_SIZE +
-                                  GF::BYTE_SIZE;
+                                  (L - 1) * GF::BYTE_SIZE +
+                                  (L - 1) * GF::BYTE_SIZE + GF::BYTE_SIZE;
 
   RandomTapes random_tapes(instance.num_repetitions, instance.num_MPC_parties,
                            random_tape_size);
@@ -767,7 +796,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
                                 instance.block_cipher_params.num_sboxes);
 
   RepContainer<GF> rep_shared_dot_a(instance.num_repetitions,
-                                    instance.num_MPC_parties, L);
+                                    instance.num_MPC_parties, L - 1);
   RepContainer<GF> rep_shared_dot_c(instance.num_repetitions,
                                     instance.num_MPC_parties, 1);
 
@@ -795,7 +824,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
       auto shared_t = rep_shared_t.get(repetition, party);
       auto random_t_shares = random_tapes.get_bytes(
           repetition, party, instance.block_cipher_params.key_size,
-          L * instance.block_cipher_params.block_size);
+          (L - 1) * instance.block_cipher_params.block_size);
       for (size_t ell = 0; ell < L - 1; ell++) {
         shared_t[ell].from_bytes(random_t_shares.data() +
                                  ell * instance.block_cipher_params.block_size);
@@ -862,15 +891,16 @@ bool rainier_verify_template(const signature_instance_t &instance,
       if (party != missing_parties[repetition]) {
         auto random_triple_bytes = random_tapes.get_bytes(
             repetition, party,
-            instance.block_cipher_params.key_size + L * GF::BYTE_SIZE,
-            (L + 1) * GF::BYTE_SIZE);
+            instance.block_cipher_params.key_size + (L - 1) * GF::BYTE_SIZE,
+            L * GF::BYTE_SIZE);
         auto a_share = rep_shared_dot_a.get(repetition, party);
-        for (size_t ell = 0; ell < L; ell++) {
+        for (size_t ell = 0; ell < L - 1; ell++) {
           a_share[ell].from_bytes(random_triple_bytes.data() +
                                   GF::BYTE_SIZE * ell);
         }
         auto c_share = rep_shared_dot_c.get(repetition, party);
-        c_share[0].from_bytes(random_triple_bytes.data() + GF::BYTE_SIZE * L);
+        c_share[0].from_bytes(random_triple_bytes.data() +
+                              GF::BYTE_SIZE * (L - 1));
       }
     }
 
@@ -894,13 +924,18 @@ bool rainier_verify_template(const signature_instance_t &instance,
     size_t missing_party = missing_parties[repetition];
 
     v_shares[repetition].resize(instance.num_MPC_parties);
-    std::vector<GF> alphas(L);
+    std::vector<GF> alphas(L - 1);
     for (size_t party = 0; party < instance.num_MPC_parties; party++) {
       auto alpha_shares = rep_alpha_shares.get(repetition, party);
       auto a_shares = rep_shared_dot_a.get(repetition, party);
       auto s_shares = rep_shared_s.get(repetition, party);
       if (party != missing_party) {
-        for (size_t ell = 0; ell < L; ell++) {
+        // index 0 is opt c.5
+        alpha_shares[0] = s_shares[0] * epsilons[repetition][0] +
+                          s_shares[L - 1] * epsilons[repetition][L - 1] +
+                          a_shares[0];
+        alphas[0] += alpha_shares[0];
+        for (size_t ell = 1; ell < L - 1; ell++) {
           alpha_shares[ell] =
               s_shares[ell] * epsilons[repetition][ell] - a_shares[ell];
           alphas[ell] += alpha_shares[ell];
@@ -909,7 +944,7 @@ bool rainier_verify_template(const signature_instance_t &instance,
     }
     // fill missing shares
     auto missing_alphas = rep_alpha_shares.get(repetition, missing_party);
-    for (size_t ell = 0; ell < L; ell++) {
+    for (size_t ell = 0; ell < L - 1; ell++) {
       missing_alphas[ell] = proof.missing_alpha_shares[ell];
       alphas[ell] += proof.missing_alpha_shares[ell];
     }
@@ -919,13 +954,20 @@ bool rainier_verify_template(const signature_instance_t &instance,
         auto t_shares = rep_shared_t.get(repetition, party);
         auto c_share = rep_shared_dot_c.get(repetition, party);
         v_shares[repetition][party] -= c_share[0];
-        for (size_t ell = 0; ell < L; ell++) {
+        for (size_t ell = 1; ell < L - 1; ell++) {
           v_shares[repetition][party] -= alphas[ell] * t_shares[ell];
         }
+        GF key_share;
+        key_share.from_bytes(rep_shared_keys.get(repetition, party).data());
+        v_shares[repetition][party] -= alphas[0] * key_share;
+        // add repeated multiplier shares here
+        v_shares[repetition][party] +=
+            epsilons[repetition][0] * t_shares[0] +
+            epsilons[repetition][L - 1] * t_shares[L - 1];
       }
     }
     if (missing_party != 0) {
-      for (size_t ell = 0; ell < L; ell++) {
+      for (size_t ell = 1; ell < L - 1; ell++) {
         v_shares[repetition][0] += epsilons[repetition][ell];
       }
     }
@@ -982,9 +1024,10 @@ rainier_serialize_signature(const signature_instance_t &instance,
            instance.digest_size +                  // Com_e
            instance.block_cipher_params.key_size + // delta sk
            (instance.block_cipher_params.num_sboxes - 1) *
-               GF::BYTE_SIZE +                                       // delta t
-           instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE + // alpha
-           GF::BYTE_SIZE);                                           // delta_c
+               GF::BYTE_SIZE + // delta t
+           (instance.block_cipher_params.num_sboxes - 1) *
+               GF::BYTE_SIZE + // alpha
+           GF::BYTE_SIZE);     // delta_c
   serialized.reserve(signature_size);
 
   serialized.insert(serialized.end(), signature.salt.begin(),
@@ -1014,8 +1057,9 @@ rainier_serialize_signature(const signature_instance_t &instance,
     }
     current_size = serialized.size();
     serialized.resize(current_size +
-                      instance.block_cipher_params.num_sboxes * GF::BYTE_SIZE);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes; k++) {
+                      (instance.block_cipher_params.num_sboxes - 1) *
+                          GF::BYTE_SIZE);
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
       proof.missing_alpha_shares[k].to_bytes(serialized.data() + current_size +
                                              k * GF::BYTE_SIZE);
     }
@@ -1080,8 +1124,8 @@ rainier_deserialize_signature(const signature_instance_t &instance,
     }
 
     std::vector<GF> missing_alpha_shares;
-    missing_alpha_shares.reserve(instance.block_cipher_params.num_sboxes);
-    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes; k++) {
+    missing_alpha_shares.reserve(instance.block_cipher_params.num_sboxes - 1);
+    for (size_t k = 0; k < instance.block_cipher_params.num_sboxes - 1; k++) {
       tmp.from_bytes(serialized.data() + current_offset);
       current_offset += GF::BYTE_SIZE;
       missing_alpha_shares.push_back(tmp);

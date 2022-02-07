@@ -86,6 +86,29 @@ rain_with_sbox_output(const std::vector<uint8_t> &key_in,
   state += key;
   state.to_bytes(ciphertext_out.data());
 
+  //// change triples 1 and L to opt c5
+  //// k * (p + s_2 + k + c_1 + c_2) = 1*M_1 −p*s_2 −p*c_2 −c_1*s_2 −c_1*c_2
+  // GF pt, ct(state);
+  // pt.from_bytes(plaintext_in.data());
+  // GF a1, a2, c1, c2;
+  // a1 = pt + result.first[1] + +key + Params::roundconst[0] +
+  // Params::roundconst[1];
+  // c1 =
+  // GF(1).multiply_with_transposed_GF2_matrix(Params::matrix_transposed[0]) -
+  //(pt + Params::roundconst[0]) * (result.first[1] + Params::roundconst[1]);
+
+  //// k \cdot (t_3M_3 + k + c + c_4) = 1 - (t_3M_3)c - c_4c\,.
+  // GF t(result.second[Params::NUM_SBOXES - 2]);
+  // t = t.multiply_with_transposed_GF2_matrix(
+  // Params::matrix_transposed[Params::NUM_SBOXES - 2]);
+  // a2 = t + key + ct + Params::roundconst[Params::NUM_SBOXES - 1];
+  // c2 = GF(1) - (t + Params::roundconst[Params::NUM_SBOXES - 1]) * ct;
+
+  // result.first[0] = a1;
+  // result.second[0] = c1;
+  // result.first[Params::NUM_SBOXES - 1] = a2;
+  // result.second[PARAMS::NUM_SBOXES - 1] = c2;
+
   return result;
 }
 
@@ -96,14 +119,15 @@ void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
               const std::vector<uint8_t> &ciphertext_in,
               std::vector<gsl::span<GF>> &s_shares) {
   const size_t num_parties = key_in.size();
+  GF pt, ct;
+  pt.from_bytes(plaintext_in.data());
+  ct.from_bytes(ciphertext_in.data());
 
   for (size_t party = 0; party < num_parties; party++) {
     size_t sbox_index = 0;
     GF key, state;
     key.from_bytes(key_in[party].data());
     if (party == 0) {
-      GF pt;
-      pt.from_bytes(plaintext_in.data());
       state += pt;
     }
     // first r-1 rounds
@@ -123,19 +147,43 @@ void rain_mpc(const std::vector<gsl::span<uint8_t>> &key_in,
       state = state.multiply_with_transposed_GF2_matrix(
           Params::matrix_transposed[r]);
     }
-    // last round
-    state += key;
-    if (party == 0) {
-      state += Params::roundconst[Params::NUM_SBOXES - 1];
-    }
-    s_shares[party][sbox_index] = state;
-    // Opt C.4: calculate the last t_share instead of injecting it
+    // last round (not needed anymore because of opt C.5)
+    // state += key;
+    // if (party == 0) {
+    // state += Params::roundconst[Params::NUM_SBOXES - 1];
+    //}
+    // s_shares[party][sbox_index] = state;
+    //// Opt C.4: calculate the last t_share instead of injecting it
+    // if (party == 0)
+    // state = ct;
+    // else
+    // state = GF(0);
+    // state += key;
+    // t_shares[party][sbox_index++] = state;
+
+    // Opt C.5
+    GF a1, a2, c1, c2;
+    a1 = t_shares[party][0];
     if (party == 0)
-      state.from_bytes(ciphertext_in.data());
-    else
-      state = GF(0);
-    state += key;
-    t_shares[party][sbox_index++] = state;
+      c1 = GF(1);
+
+    c1 -= (pt + Params::roundconst[0]) * t_shares[party][0];
+
+    // k \cdot (t_3M_3 + k + c + c_4) = 1 - (t_3M_3)c - c_4c\,.
+    GF t(t_shares[party][Params::NUM_SBOXES - 2]);
+    t = t.multiply_with_transposed_GF2_matrix(
+        Params::matrix_transposed[Params::NUM_SBOXES - 2]);
+    a2 = t + key;
+    if (party == 0)
+      a2 += ct + Params::roundconst[Params::NUM_SBOXES - 1];
+    if (party == 0)
+      c2 = GF(1) - Params::roundconst[Params::NUM_SBOXES - 1] * ct;
+    c2 -= t * ct;
+
+    s_shares[party][0] = a1;
+    t_shares[party][0] = c1;
+    s_shares[party][Params::NUM_SBOXES - 1] = a2;
+    t_shares[party][Params::NUM_SBOXES - 1] = c2;
   }
 }
 
